@@ -238,6 +238,98 @@ def list_interfaces() -> List[str]:
         return []
 
 
+@dataclass(frozen=True)
+class InterfaceInfo:
+    """One capture interface, described well enough to choose between them.
+
+    A bare interface name is not something a user can pick from — on Windows
+    they are adapter GUIDs, and even on Unix `en11` says nothing about which
+    cable it is. The address is what identifies the right one, because the
+    instrument's address is already known.
+    """
+
+    name: str
+    description: str = ""
+    ip: str = ""
+    mac: str = ""
+
+    def label(self) -> str:
+        parts = [self.description or self.name]
+        if self.ip:
+            parts.append(f"— {self.ip}")
+        return " ".join(parts)
+
+
+def describe_interfaces() -> List[InterfaceInfo]:
+    """List capture interfaces with their addresses, best-described first."""
+    try:
+        from scapy.interfaces import get_working_ifaces  # type: ignore
+
+        import scapy.arch  # noqa: F401  (initialises the platform layer)
+
+        found = []
+        for iface in get_working_ifaces():
+            found.append(
+                InterfaceInfo(
+                    name=str(getattr(iface, "name", "") or ""),
+                    description=str(getattr(iface, "description", "") or ""),
+                    ip=str(getattr(iface, "ip", "") or ""),
+                    mac=str(getattr(iface, "mac", "") or ""),
+                )
+            )
+        if found:
+            # Interfaces holding an address are the plausible ones; the rest are
+            # disabled or virtual adapters and belong at the bottom.
+            found.sort(key=lambda i: (not i.ip, i.name))
+            return found
+    except Exception:
+        pass
+    return [InterfaceInfo(name=n) for n in list_interfaces()]
+
+
+def _same_subnet(a: str, b: str) -> bool:
+    """Rough test for two addresses being on the same link.
+
+    Netmasks are not exposed consistently across platforms, so this compares
+    prefixes: /16 for link-local, which is the actual APIPA block, and /24
+    otherwise, which covers ordinary lab subnets.
+    """
+    pa, pb = a.split("."), b.split(".")
+    if len(pa) != 4 or len(pb) != 4:
+        return False
+    if pa[0] == "169" and pa[1] == "254":
+        return pb[0] == "169" and pb[1] == "254"
+    return pa[:3] == pb[:3]
+
+
+def interface_for(device_ip: str) -> Optional[str]:
+    """Work out which interface can reach `device_ip`.
+
+    Subnet matching comes first and the routing table second. An instrument on
+    a direct cable self-assigns a 169.254.x.x address with no route to it, so
+    the routing table answers with the default gateway — the internet-facing
+    adapter, which is the one interface guaranteed not to see the instrument.
+    Matching the address against each adapter's own address gets that right.
+    """
+    if not device_ip:
+        return None
+
+    for iface in describe_interfaces():
+        if iface.ip and _same_subnet(device_ip, iface.ip):
+            return iface.name
+
+    try:
+        from scapy.all import conf  # type: ignore
+
+        if conf.route is not None:
+            name = conf.route.route(device_ip)[0]
+            if name:
+                return str(name)
+    except Exception:
+        pass
+    return None
+
+
 class PacketPump:
     """Captures packets for one device and turns them into stream chunks.
 

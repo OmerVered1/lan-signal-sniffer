@@ -208,6 +208,83 @@ def test_no_warning_when_already_elevated(monkeypatch):
     assert state.ok and not state.warning
 
 
+# ----- choosing the right adapter -------------------------------------------
+
+
+def fake_interfaces(monkeypatch, entries):
+    """entries: [(name, description, ip)]"""
+    monkeypatch.setattr(
+        capture,
+        "describe_interfaces",
+        lambda: [
+            capture.InterfaceInfo(name=n, description=d, ip=ip) for n, d, ip in entries
+        ],
+    )
+
+
+def test_link_local_instrument_picks_the_adapter_on_its_own_link(monkeypatch):
+    """The real lab case: an instrument on a direct cable, no DHCP.
+
+    169.254.x.x is self-assigned because nothing is handing out addresses, and
+    there is no route to it — so the routing table answers with the default
+    gateway, i.e. the internet-facing adapter, which is the one interface
+    guaranteed not to see the instrument. Matching against each adapter's own
+    address is what gets this right.
+    """
+    fake_interfaces(
+        monkeypatch,
+        [
+            ("eth0", "Corporate LAN", "132.72.15.65"),
+            ("eth1", "Instrument link", "169.254.93.5"),
+            ("wlan0", "Wi-Fi", "10.0.0.4"),
+        ],
+    )
+    assert capture.interface_for("169.254.93.1") == "eth1"
+
+
+def test_ordinary_subnet_match(monkeypatch):
+    fake_interfaces(
+        monkeypatch,
+        [("eth0", "LAN", "192.168.1.20"), ("eth1", "Lab", "10.20.30.4")],
+    )
+    assert capture.interface_for("10.20.30.99") == "eth1"
+
+
+def test_a_link_local_adapter_is_not_matched_to_a_routable_address(monkeypatch):
+    fake_interfaces(monkeypatch, [("eth1", "Instrument link", "169.254.93.5")])
+    monkeypatch.setattr(capture, "list_interfaces", lambda: [])
+    assert capture.interface_for("192.168.1.50") != "eth1"
+
+
+def test_no_address_yields_no_guess(monkeypatch):
+    fake_interfaces(monkeypatch, [("eth0", "LAN", "192.168.1.20")])
+    assert capture.interface_for("") is None
+
+
+def test_interfaces_are_labelled_with_something_a_person_can_pick(monkeypatch):
+    info = capture.InterfaceInfo(
+        name=r"\Device\NPF_{A1B2}", description="Intel I219-LM", ip="169.254.93.5"
+    )
+    label = info.label()
+    assert "Intel I219-LM" in label and "169.254.93.5" in label
+    assert "NPF_" not in label, "the GUID is for scapy, not for the user"
+
+
+def test_addressed_interfaces_are_offered_before_dormant_ones(monkeypatch):
+    install_fake_scapy(monkeypatch, [], where="scapy.interfaces")
+
+    class Iface:
+        def __init__(self, name, ip):
+            self.name, self.ip, self.description, self.mac = name, ip, name, ""
+
+    sys.modules["scapy.interfaces"].get_working_ifaces = lambda: [
+        Iface("dormant0", ""),
+        Iface("eth1", "169.254.93.5"),
+    ]
+    names = [i.name for i in capture.describe_interfaces()]
+    assert names[0] == "eth1"
+
+
 def test_readiness_never_raises(monkeypatch):
     # The banner is the app's way of explaining a broken environment; it must
     # not itself be the thing that crashes on one.

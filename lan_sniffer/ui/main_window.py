@@ -33,7 +33,12 @@ from PyQt5.QtWidgets import (
 )
 
 from .._version import __app_name__, __version__
-from ..capture.capture import PacketPump, capture_readiness, list_interfaces
+from ..capture.capture import (
+    PacketPump,
+    capture_readiness,
+    describe_interfaces,
+    interface_for,
+)
 from ..capture.neighbors import arp_neighbors
 from ..capture.reassembly import C2S, StreamChunk
 from ..protocol.framer import (
@@ -133,13 +138,21 @@ class MainWindow(QMainWindow):
         self._readiness.setTextFormat(Qt.RichText)
 
         self._interface = QComboBox()
-        self._interface.addItem("(default)", None)
-        for name in list_interfaces():
-            self._interface.addItem(name, name)
+        self._interface.setToolTip(
+            "Which network adapter to listen on. Capture sees only the traffic\n"
+            "crossing the adapter you pick, so this has to be the one the\n"
+            "instrument is connected through.\n\n"
+            "Leave it on automatic: the app matches the instrument's address\n"
+            "against each adapter's own address and picks the one on the same\n"
+            "link."
+        )
+        self._populate_interfaces()
 
         self._device = QComboBox()
         self._device.setEditable(True)
         self._device.setMinimumWidth(220)
+        self._device.currentTextChanged.connect(self._on_device_changed)
+        self._device.editTextChanged.connect(self._on_device_changed)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self._refresh_devices)
         device_row = QHBoxLayout()
@@ -239,6 +252,34 @@ class MainWindow(QMainWindow):
             )
         self._capture_ready = state.ok
 
+    def _populate_interfaces(self) -> None:
+        """Fill the adapter list, automatic first."""
+        self._interface.clear()
+        self._interface.addItem("(automatic)", None)
+        for iface in describe_interfaces():
+            self._interface.addItem(iface.label(), iface.name)
+
+    def _on_device_changed(self, *_args) -> None:
+        """Show which adapter automatic mode has settled on.
+
+        Resolving it silently would leave the user unable to tell a correct
+        guess from a wrong one, which matters because the wrong adapter
+        captures perfectly and sees nothing.
+        """
+        if self._interface.currentData() is not None:
+            return
+        ip = self._selected_ip()
+        chosen = interface_for(ip) if ip else None
+        label = "(automatic)" if not chosen else f"(automatic — {chosen})"
+        self._interface.setItemText(0, label)
+
+    def _resolved_interface(self) -> Optional[str]:
+        """The adapter to capture on: the explicit choice, or the best match."""
+        explicit = self._interface.currentData()
+        if explicit is not None:
+            return str(explicit)
+        return interface_for(self._selected_ip())
+
     def _refresh_devices(self) -> None:
         neighbors, diagnostic = arp_neighbors()
         current = self._device.currentText()
@@ -247,6 +288,8 @@ class MainWindow(QMainWindow):
             self._device.addItem(f"{n.ip}  ({n.mac})", n.ip)
         if current:
             self._device.setEditText(current)
+        self._populate_interfaces()
+        self._on_device_changed()
         self.statusBar().showMessage(
             diagnostic or f"{len(neighbors)} device(s) in the ARP cache", 6000
         )
@@ -310,7 +353,7 @@ class MainWindow(QMainWindow):
             return
 
         port = self._port.value() or None
-        self._pump = PacketPump(ip, port, self._interface.currentData())
+        self._pump = PacketPump(ip, port, self._resolved_interface())
         try:
             self._pump.start()
         except Exception as e:
