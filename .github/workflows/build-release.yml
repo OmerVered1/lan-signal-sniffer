@@ -1,0 +1,153 @@
+name: Build & Release
+
+# Pushing a vX.Y.Z tag builds both platforms and publishes a release.
+# workflow_dispatch builds without publishing, for checking a change compiles.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # The test suite needs no capture driver and no GUI, so it gates the builds.
+  # Shipping an installer built from a red commit is worse than shipping late.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: pip install numpy pytest
+      - name: Run the suite
+        run: python -m pytest tests/ -q
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install PyQt5 pyqtgraph numpy scapy pyinstaller
+
+      - name: Build the Windows folder distribution
+        run: pyinstaller lan_signal_sniffer.spec --noconfirm
+
+      - name: Check the executable was produced
+        shell: pwsh
+        run: |
+          $exe = "dist\LAN Signal Sniffer\LAN Signal Sniffer.exe"
+          if (-not (Test-Path $exe)) {
+            throw "PyInstaller did not produce $exe"
+          }
+          Write-Host "built: $((Get-Item $exe).Length) bytes"
+
+      - name: Resolve version from the tag
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build the installer
+        shell: cmd
+        run: >
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          /DAppVersion=${{ steps.ver.outputs.version }}
+          windows_installer.iss
+
+      - name: Rename the installer to the name the updater looks for
+        shell: pwsh
+        run: |
+          $built = "installer_out\LAN-Signal-Sniffer-Setup-${{ steps.ver.outputs.version }}.exe"
+          Copy-Item $built "LAN-Signal-Sniffer-Windows-Setup.exe"
+
+      - name: Also package the plain folder build
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist\LAN Signal Sniffer" `
+                           -DestinationPath "LAN-Signal-Sniffer-Windows-portable.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            LAN-Signal-Sniffer-Windows-Setup.exe
+            LAN-Signal-Sniffer-Windows-portable.zip
+
+  build-macos:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install PyQt5 pyqtgraph numpy scapy pyinstaller
+
+      - name: Build the macOS app bundle
+        run: pyinstaller lan_signal_sniffer.spec --noconfirm
+
+      - name: Package the app
+        run: |
+          cd dist
+          zip -qr "../LAN-Signal-Sniffer-macOS.zip" "LAN Signal Sniffer.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: LAN-Signal-Sniffer-macOS.zip
+
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/windows/LAN-Signal-Sniffer-Windows-Setup.exe
+            artifacts/windows/LAN-Signal-Sniffer-Windows-portable.zip
+            artifacts/macos/LAN-Signal-Sniffer-macOS.zip
+          generate_release_notes: true
+          body: |
+            ## Installing
+
+            **Windows** — download `LAN-Signal-Sniffer-Windows-Setup.exe` and run it.
+            Python, PyQt5, numpy and scapy are all bundled; you do not need to
+            install any of them.
+
+            One thing is not bundled and cannot be: **[Npcap](https://npcap.com)**,
+            the packet capture driver. It is a kernel driver with its own
+            installer and licence. Install it with *WinPcap API-compatible mode*
+            ticked — Wireshark itself is not needed — and the installer will
+            remind you if it is missing.
+
+            Then run the app **as Administrator**; capture does not work without
+            it, and the app will say so rather than showing an empty graph.
+
+            **macOS** — unzip and drag to Applications, then launch from a
+            terminal with `sudo` so the capture devices can be opened.

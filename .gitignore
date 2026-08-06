@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Build output
+build/
+dist/
+installer_out/
+*.manifest
+
+# Recorded sessions — data, not source. These can be large, and a raw sidecar
+# holds the full traffic of an experiment.
+*.csv
+*.raw.jsonl
+
+# Profiles written by the identification wizard at run time. The two seed
+# profiles are force-added; see .gitattributes note in README.
+# (Nothing excluded here — profiles/ is tracked deliberately.)
+
+# OS
+.DS_Store
+Thumbs.db

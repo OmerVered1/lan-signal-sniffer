@@ -1,0 +1,19 @@
+# LAN Signal Sniffer
+
+PyQt5>=5.15.0
+pyqtgraph>=0.13.0
+numpy>=1.24.0
+
+# Packet capture. scapy is the Python side; the kernel driver underneath it is
+# a separate, manual install:
+#   Windows  Npcap from https://npcap.com, with "WinPcap API-compatible mode"
+#            ticked. Wireshark is NOT required — Npcap is the capture engine
+#            Wireshark happens to bundle, and it installs on its own.
+#            The app must then be run as Administrator.
+#   macOS    built in; run with sudo so the BPF devices can be opened.
+#   Linux    built in; run with sudo, or grant CAP_NET_RAW.
+scapy>=2.5.0
+
+# Tests only. The decoding engine has no scapy dependency, so the whole suite
+# runs without a capture driver installed.
+pytest>=7.0.0
