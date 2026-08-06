@@ -35,65 +35,206 @@ MAX_QUEUED_PACKETS = 20000
 
 @dataclass
 class Readiness:
-    """Whether this machine can capture, and what to do if it cannot."""
+    """Whether this machine can capture, and what to do if it cannot.
+
+    `warning` covers the case where capture is not blocked but is likely to
+    fail anyway — listing interfaces needs fewer rights than opening them, so a
+    green banner followed by a failure at Start capture is possible without it.
+    """
 
     ok: bool
     detail: str
     remedy: str = ""
+    warning: str = ""
+
+
+def _get_if_list():
+    """Return scapy's interface-listing function, from an initialised scapy.
+
+    Two things have to be right here, and getting either wrong is quiet rather
+    than loud.
+
+    Where the symbol lives: `get_if_list` is defined in `scapy.interfaces` and
+    re-exported from `scapy.arch`. It has never been in `scapy.arch.common`,
+    which an earlier version of this module imported — that raised on every
+    platform, and a broad `except` reported it as a missing capture driver, so
+    the app told people to install Npcap they already had.
+
+    When it works: the list it reads is populated by the platform layer that
+    `scapy.arch` sets up on import. Resolving it from `scapy.interfaces` without
+    that gives a function which returns an empty list on a machine with two
+    dozen interfaces — no error at all, just an empty device dropdown. So
+    `scapy.arch` is tried first, and `scapy.interfaces` only as a last resort.
+    """
+    last_error = None
+    for module_name in ("scapy.arch", "scapy.all", "scapy.interfaces"):
+        try:
+            module = __import__(module_name, fromlist=["get_if_list"])
+            return getattr(module, "get_if_list")
+        except (ImportError, AttributeError) as e:
+            last_error = e
+    raise ImportError(
+        f"scapy is installed but get_if_list could not be resolved from "
+        f"scapy.arch, scapy.all or scapy.interfaces ({last_error})"
+    )
+
+
+def _is_elevated() -> bool:
+    """True if the process has the rights packet capture needs."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    try:
+        import os
+
+        return os.geteuid() == 0
+    except AttributeError:  # pragma: no cover - non-POSIX without win32
+        return False
+
+
+def _npcap_installed() -> bool:
+    """Check for Npcap directly, rather than inferring it from a failure.
+
+    Mirrors the check in windows_installer.iss. Npcap keeps wpcap.dll under
+    System32\\Npcap, and installing it in the WinPcap-compatible mode this app
+    needs also drops a copy directly in System32; the service key is the
+    fallback for layouts that have differed between Npcap versions.
+    """
+    if sys.platform != "win32":
+        return True  # not applicable; libpcap is part of the OS
+
+    import os
+
+    system32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    for path in (
+        os.path.join(system32, "Npcap", "wpcap.dll"),
+        os.path.join(system32, "wpcap.dll"),
+    ):
+        if os.path.exists(path):
+            return True
+
+    try:
+        import winreg
+
+        for root, key in (
+            (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\npcap"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Npcap"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Npcap"),
+        ):
+            try:
+                with winreg.OpenKey(root, key):
+                    return True
+            except OSError:
+                continue
+    except ImportError:  # pragma: no cover - winreg is Windows-only
+        pass
+    return False
 
 
 def capture_readiness() -> Readiness:
-    """Check that a capture backend is installed and usable."""
+    """Report whether capture will work, and if not, why.
+
+    Each failure gets its own answer. Four different causes used to collapse
+    into "install Npcap", which is unhelpful when the driver is present and
+    actively misleading when the real problem is something else.
+    """
     try:
         import scapy  # noqa: F401
     except ImportError:
         return Readiness(
             ok=False,
             detail="scapy is not installed",
-            remedy="pip install scapy",
+            remedy=(
+                "Run: pip install scapy\n"
+                "(Installed builds bundle it — seeing this in one means the "
+                "build is broken.)"
+            ),
         )
 
     try:
-        from scapy.arch.common import get_if_list  # type: ignore
-
-        interfaces = get_if_list()
-    except Exception as e:  # pragma: no cover - depends on host networking
-        if sys.platform == "win32":
+        interfaces = list(_get_if_list()())
+    except Exception as e:
+        if sys.platform == "win32" and not _npcap_installed():
             return Readiness(
                 ok=False,
-                detail=f"no capture driver available ({e})",
+                detail="Npcap is not installed",
                 remedy=(
-                    "Install Npcap from https://npcap.com with "
-                    "'WinPcap API-compatible mode' ticked, then run this app as "
-                    "Administrator. Wireshark itself is not needed."
+                    "Install Npcap from https://npcap.com with 'WinPcap "
+                    "API-compatible mode' ticked, then restart this app. "
+                    "Wireshark itself is not needed."
                 ),
             )
         return Readiness(
             ok=False,
-            detail=f"no capture interfaces available ({e})",
-            remedy="On macOS and Linux, capture needs root: run with sudo.",
-        )
-
-    if not interfaces:
-        return Readiness(
-            ok=False,
-            detail="no capture interfaces were found",
+            detail=f"could not list capture interfaces: {e}",
             remedy=(
-                "Install Npcap (https://npcap.com) and run as Administrator."
+                "Run this app as Administrator."
                 if sys.platform == "win32"
-                else "Run with sudo so the BPF devices can be opened."
+                else "Capture needs root: run with sudo."
             ),
         )
-    return Readiness(ok=True, detail=f"{len(interfaces)} capture interface(s) available")
+
+    if interfaces:
+        # Listing interfaces takes fewer rights than opening one for capture,
+        # so this is not proof that capture will work. Flag it rather than
+        # promise success and fail at Start capture.
+        warning = ""
+        if not _is_elevated():
+            warning = (
+                "Interfaces are visible, but capture also needs elevated "
+                "rights — "
+                + (
+                    "restart as Administrator"
+                    if sys.platform == "win32"
+                    else "relaunch with sudo"
+                )
+                + " if starting the capture fails."
+            )
+        return Readiness(
+            ok=True,
+            detail=f"{len(interfaces)} capture interface(s) available",
+            warning=warning,
+        )
+
+    # No interfaces. Say which of the possible causes actually applies.
+    if sys.platform == "win32" and not _npcap_installed():
+        return Readiness(
+            ok=False,
+            detail="Npcap is not installed",
+            remedy=(
+                "Install Npcap from https://npcap.com with 'WinPcap "
+                "API-compatible mode' ticked, then restart this app."
+            ),
+        )
+    if not _is_elevated():
+        return Readiness(
+            ok=False,
+            detail="no capture interfaces are visible without elevated rights",
+            remedy=(
+                "Right-click the app and choose 'Run as administrator'."
+                if sys.platform == "win32"
+                else "Capture needs root: relaunch with sudo."
+            ),
+        )
+    return Readiness(
+        ok=False,
+        detail="no capture interfaces were found",
+        remedy=(
+            "The capture driver is installed and this app is elevated, so this "
+            "is unusual. Check that a network adapter is enabled."
+        ),
+    )
 
 
 def list_interfaces() -> List[str]:
     """Names of the interfaces that can be captured on."""
     try:
-        from scapy.arch.common import get_if_list  # type: ignore
-
-        return list(get_if_list())
-    except Exception:  # pragma: no cover - depends on host networking
+        return list(_get_if_list()())
+    except Exception:
         return []
 
 

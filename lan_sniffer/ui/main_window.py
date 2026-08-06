@@ -228,9 +228,10 @@ class MainWindow(QMainWindow):
     def _check_readiness(self) -> None:
         state = capture_readiness()
         if state.ok:
-            self._readiness.setText(
-                f"<span style='color:#1a7f37'>Capture ready — {state.detail}.</span>"
-            )
+            text = f"<span style='color:#1a7f37'>Capture ready — {state.detail}.</span>"
+            if state.warning:
+                text += f"<br><span style='color:#a04000'>{state.warning}</span>"
+            self._readiness.setText(text)
         else:
             self._readiness.setText(
                 f"<b style='color:#a04000'>Cannot capture: {state.detail}.</b>"
