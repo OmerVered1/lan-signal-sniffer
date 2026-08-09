@@ -420,7 +420,9 @@ class MainWindow(QMainWindow):
         self._redraw_timer.stop()
         if self._survey_raw is not None:
             self._finish_survey()
-        self._close_session(manual=True)
+        # Not manual=True: shutting the capture down is teardown, not the
+        # user ending a session, and must not change the detector's arming.
+        self._close_session()
         if self._pump is not None:
             self._pump.stop()
             self._pump = None
@@ -795,15 +797,27 @@ class MainWindow(QMainWindow):
         stamp = time.strftime("%Y%m%d_%H%M%S")
         base = self._output_dir / f"{_slug(self._profile.name)}_{stamp}"
         units = {s.name: s.unit for s in self._profile.signals}
-        self._csv = SessionCSVWriter(
-            base.with_suffix(".csv"), self._profile.signal_names, units
-        )
-        self._raw = RawWriter(
-            Path(str(base) + ".raw.jsonl"),
-            device_ip=self._selected_ip(),
-            device_port=self._port.value() or None,
-            note=f"profile: {self._profile.name}",
-        )
+        try:
+            self._csv = SessionCSVWriter(
+                base.with_suffix(".csv"), self._profile.signal_names, units
+            )
+            self._raw = RawWriter(
+                Path(str(base) + ".raw.jsonl"),
+                device_ip=self._selected_ip(),
+                device_port=self._port.value() or None,
+                note=f"profile: {self._profile.name}",
+            )
+        except OSError as e:
+            # Raised from a timer callback this would vanish into the console
+            # and leave the app looking armed but recording nothing.
+            self._csv = self._raw = None
+            QMessageBox.critical(
+                self,
+                "Could not start recording",
+                f"{e}\n\nThe run is going but nothing is being written. Check "
+                f"that this folder exists and is writable:\n{self._output_dir}",
+            )
+            return
         self._session_started = time.time()
         self._live.mark_session(self._session_started, "start")
         if manual and self._detector is not None:

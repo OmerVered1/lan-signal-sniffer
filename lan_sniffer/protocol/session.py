@@ -266,7 +266,12 @@ class SessionDetector:
         self._positives: Deque[float] = deque()
         self._running = False
         self._last_positive: Optional[float] = None
-        self._manual_override = False
+        # Set when the running session was started by hand. It suppresses the
+        # quiet timeout for that session only — it must never disable
+        # detection itself, which is what a sticky override did: one press of
+        # Stop, or one capture restart, and no run was ever auto-detected
+        # again for the life of the process.
+        self._hand_started = False
 
         # Diagnostics. When a session fails to start there is nothing on screen
         # to say why, and the two likely causes — the capture began after the
@@ -319,7 +324,7 @@ class SessionDetector:
         while self._recent and obs.ts - self._recent[0] > self._window:
             self._recent.popleft()
 
-        if self._manual_override or self._cal.mode == MODE_MANUAL:
+        if self._cal.mode == MODE_MANUAL:
             if self._running:
                 self._last_positive = obs.ts
             return None
@@ -351,7 +356,7 @@ class SessionDetector:
 
     def tick(self, now: float) -> Optional[str]:
         """Check whether a running session has gone quiet long enough to end."""
-        if not self._running or self._manual_override:
+        if not self._running or self._hand_started:
             return None
         if self._last_positive is None:
             return None
@@ -368,18 +373,25 @@ class SessionDetector:
     # ----- manual controls ----------------------------------------------
 
     def start(self, now: float) -> None:
-        self._manual_override = True
+        """Begin recording by hand.
+
+        Automatic detection keeps running: an explicit stop command should
+        still close a session the user opened, and the next run should still be
+        picked up on its own.
+        """
         self._running = True
         self._last_positive = now
+        self._hand_started = True
 
     def stop(self) -> None:
-        self._manual_override = True
+        """End the current session by hand, and stay armed for the next run."""
         self._running = False
         self._positives.clear()
+        self._hand_started = False
 
     def resume_automatic(self) -> None:
-        """Hand control back to the detector after a manual start or stop."""
-        self._manual_override = False
+        """Drop the hand-started marker, restoring the quiet timeout."""
+        self._hand_started = False
         self._positives.clear()
 
     # ----- internals ----------------------------------------------------

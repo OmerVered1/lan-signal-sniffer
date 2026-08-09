@@ -294,3 +294,76 @@ def test_the_trigger_itself_is_not_listed_as_a_near_miss():
     det = SessionDetector(dsc_calibration())
     det.observe(Observation(1.0, START_CMD))
     assert START_CMD not in det.near_misses
+
+
+# ----- arming must survive manual use and capture restarts ------------------
+
+
+def test_auto_detection_survives_a_manual_stop():
+    """The shipped bug: one manual stop disabled detection for ever.
+
+    A sticky override meant that after the user pressed Stop session once — or
+    simply stopped and restarted the capture, which took the same path — no run
+    was ever detected again. It still *reported* seeing the trigger, because
+    that is recorded before the override was checked, so the panel read "start
+    command last seen 44 s ago" while nothing recorded.
+    """
+    det = SessionDetector(dsc_calibration())
+    det.observe(Observation(20.0, START_CMD))
+    assert det.running
+    det.stop()
+    assert not det.running
+
+    assert det.observe(Observation(1500.0, START_CMD)) == "start", (
+        "the next run must still be detected after a manual stop"
+    )
+    assert det.running
+
+
+def test_auto_detection_survives_a_manual_start_and_its_stop_command():
+    det = SessionDetector(dsc_calibration())
+    det.start(10.0)
+    assert det.running
+    # A hand-started session must still close on the instrument's own command.
+    assert det.observe(Observation(920.0, STOP_CMD)) == "stop"
+    assert not det.running
+    # And the run after that must still be picked up.
+    assert det.observe(Observation(1500.0, START_CMD)) == "start"
+
+
+def test_a_hand_started_session_is_not_closed_by_the_quiet_timeout():
+    cal = Calibration(
+        mode=MODE_SIGNATURE,
+        trigger_signatures=["go"],
+        start_streak=1,
+        quiet_seconds=5.0,
+    )
+    det = SessionDetector(cal)
+    det.start(0.0)
+    assert det.tick(10_000.0) is None
+    assert det.running
+
+
+def test_an_auto_started_session_still_times_out_when_there_is_no_stop_command():
+    cal = Calibration(
+        mode=MODE_SIGNATURE,
+        trigger_signatures=["go"],
+        start_streak=1,
+        quiet_seconds=5.0,
+    )
+    det = SessionDetector(cal)
+    det.observe(Observation(0.0, "go"))
+    assert det.tick(6.0) == "stop"
+
+
+def test_repeated_start_stop_cycles_keep_working():
+    # Four runs in a row, as a day of experiments would produce.
+    det = SessionDetector(dsc_calibration())
+    events = []
+    t = 0.0
+    for _ in range(4):
+        events.append(det.observe(Observation(t, START_CMD)))
+        t += 900
+        events.append(det.observe(Observation(t, STOP_CMD)))
+        t += 300
+    assert [e for e in events if e] == ["start", "stop"] * 4
