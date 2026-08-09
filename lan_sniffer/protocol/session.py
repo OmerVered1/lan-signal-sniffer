@@ -54,6 +54,10 @@ class Calibration:
 
     mode: str
     trigger_signatures: List[str] = field(default_factory=list)
+    # Explicit end-of-run commands. Without these a session can only close on a
+    # quiet timeout, which never arrives on an instrument whose software polls
+    # continuously between runs — the session would open and stay open for ever.
+    stop_signatures: List[str] = field(default_factory=list)
     rate_threshold: float = 0.0
     idle_rate: float = 0.0
     running_rate: float = 0.0
@@ -77,6 +81,7 @@ class Calibration:
         return {
             "mode": self.mode,
             "trigger_signatures": list(self.trigger_signatures),
+            "stop_signatures": list(self.stop_signatures),
             "rate_threshold": self.rate_threshold,
             "idle_rate": self.idle_rate,
             "running_rate": self.running_rate,
@@ -94,6 +99,7 @@ class Calibration:
         return cls(
             mode=d.get("mode", MODE_MANUAL),
             trigger_signatures=list(d.get("trigger_signatures", [])),
+            stop_signatures=list(d.get("stop_signatures", [])),
             rate_threshold=float(d.get("rate_threshold", 0.0)),
             idle_rate=float(d.get("idle_rate", 0.0)),
             running_rate=float(d.get("running_rate", 0.0)),
@@ -281,6 +287,13 @@ class SessionDetector:
                 self._last_positive = obs.ts
             return None
 
+        # An explicit end-of-run command is unambiguous, so it closes the
+        # session at once rather than waiting for traffic to fall quiet.
+        if self._running and obs.signature in self._cal.stop_signatures:
+            self._running = False
+            self._positives.clear()
+            return "stop"
+
         if not self._is_positive(obs):
             # Deliberately not a reset. The trigger request is one step of a
             # polling rotation, so it is always separated by the other requests
@@ -304,6 +317,10 @@ class SessionDetector:
         if not self._running or self._manual_override:
             return None
         if self._last_positive is None:
+            return None
+        if self._cal.stop_signatures:
+            # The run ends on a command, not on silence. Timing out here would
+            # cut the file mid-experiment during any lull in the trigger.
             return None
         if now - self._last_positive >= self._cal.quiet_seconds:
             self._running = False

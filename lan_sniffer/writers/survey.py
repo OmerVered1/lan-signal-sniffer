@@ -96,6 +96,16 @@ def _channel_label(index: int) -> str:
     return f"ch{index}"
 
 
+def _modal_length(payloads: Sequence[bytes]) -> int:
+    """The reply length the scan actually analysed."""
+    if not payloads:
+        return 0
+    counts: Dict[int, int] = {}
+    for p in payloads:
+        counts[len(p)] = counts.get(len(p), 0) + 1
+    return max(counts, key=lambda k: (counts[k], k))
+
+
 def build_survey(chunks: Sequence, max_candidates: int = CANDIDATES_PER_CHANNEL) -> Survey:
     """Analyse a capture and lay out every plausible field as a column."""
     survey = Survey()
@@ -191,9 +201,11 @@ def _metadata(survey: Survey, device_ip: str, device_port: Optional[int]) -> dic
                     "request_mask": [bool(m) for m in channel.mask],
                     "replies": channel.count,
                     "median_period_s": channel.median_period(),
-                    "reply_length_bytes": (
-                        len(channel.payloads[0]) if channel.payloads else 0
-                    ),
+                    # The modal length, not the first reply's. A device can
+                    # answer once with a longer combined frame at connect time,
+                    # and reporting that would send an analyst looking for
+                    # fields at offsets the steady-state reply does not have.
+                    "reply_length_bytes": _modal_length(channel.payloads),
                 }
             )
 

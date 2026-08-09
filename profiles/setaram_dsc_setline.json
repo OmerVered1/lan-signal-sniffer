@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "name": "Setaram DSC (Setline)",
+  "mac": "00:50:c2:30:d0:3b",
+  "ip_hint": "169.254.93.1",
+  "device_port": 1210,
+  "interaction": "request_response",
+  "request_framing": {
+    "mode": "single_segment",
+    "frame_len": null,
+    "delimiter": null,
+    "len_offset": 0,
+    "len_size": 2,
+    "len_endian": "big",
+    "len_adjust": 0,
+    "confidence": 1.0,
+    "notes": "request lengths genuinely vary on this device (2 to 14 bytes); one request per TCP segment"
+  },
+  "signals": [
+    {
+      "name": "sample_temperature",
+      "unit": "degC",
+      "signature": "0008",
+      "mask": [true, true],
+      "offset": 15,
+      "encoding": "f32be",
+      "scale": 1.0,
+      "bias": 0.0
+    },
+    {
+      "name": "heat_flow",
+      "unit": "uV",
+      "signature": "0008",
+      "mask": [true, true],
+      "offset": 19,
+      "encoding": "f32be",
+      "scale": 1.0,
+      "bias": 0.0
+    }
+  ],
+  "session": {
+    "mode": "signature",
+    "trigger_signatures": ["00040001000005"],
+    "stop_signatures": ["00040001000002"],
+    "rate_threshold": 0.0,
+    "idle_rate": 0.0,
+    "running_rate": 0.0,
+    "start_streak": 1,
+    "quiet_seconds": 120.0,
+    "request_mask": {},
+    "explanation": "Calisto writes to one control register to start and stop a run: 0004 0001 0000 05 starts, 0004 0001 0000 02 stops. Each is sent once, so start_streak is 1. There is no quiet timeout because this instrument is polled continuously between runs - the session ends on the stop command, not on silence."
+  },
+  "notes": "Derived from a real capture on 2026-08-09 and cross-checked against Calisto's own export of the same run. Sample temperature and heat flow both live in the reply to the 2-byte request 0008, a packed status frame of 23 bytes, at offsets 15 and 19 as big-endian float32. Agreement with Calisto: r=0.999989 / RMSE 0.044 degC for temperature, r=0.999957 / RMSE 0.021 uV for heat flow. Note that 0008 is only polled while a run is in progress, which is what makes it safe to record continuously. The C80's own commands (000100080004, 0001000a0001) are also answered by this device and carry similar-looking values, but they do NOT track what Calisto plots (r=0.73 and r=0.50) - do not assume the C80 profile works here."
+}
