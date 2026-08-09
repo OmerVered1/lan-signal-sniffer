@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from PyQt5.QtCore import Qt
+import pyqtgraph as pg
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -30,7 +32,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from ..protocol.fields import Candidate, FieldScan, scan_channel
+from ..protocol.fields import Candidate, FieldScan, decode_field, scan_channel
 from ..protocol.framer import Channel, FlowAnalysis
 from .live_view import sparkline
 
@@ -38,7 +40,23 @@ from .live_view import sparkline
 # sharply, and a long list makes the real signals harder to pick out.
 CANDIDATES_PER_CHANNEL = 6
 
-COL_USE, COL_CHANNEL, COL_WHERE, COL_TRACE, COL_RANGE, COL_NAME, COL_UNIT, COL_SCALE, COL_BIAS = range(9)
+(
+    COL_USE,
+    COL_CHANNEL,
+    COL_WHERE,
+    COL_TRACE,
+    COL_LIVE,
+    COL_RANGE,
+    COL_NAME,
+    COL_UNIT,
+    COL_SCALE,
+    COL_BIAS,
+) = range(10)
+
+# How often the live columns refresh. Fast enough to watch a value move against
+# the instrument's own display, slow enough not to re-analyse the capture
+# constantly.
+LIVE_REFRESH_MS = 1500
 
 # (name, unit, signature, mask, offset, encoding, scale, bias)
 Selection = Tuple[str, str, bytes, List[bool], int, str, float, float]
@@ -82,6 +100,15 @@ class _Row:
         self.use.stateChanged.connect(self._sync_enabled)
         self._sync_enabled()
 
+        # Filled in by the dialog so the live refresh can update them in place.
+        self.trace = None
+        self.live_item = None
+        self.range_item = None
+
+    def field(self):
+        """The (offset, encoding) currently selected for this row."""
+        return self.where.currentData()
+
     def _sync_enabled(self) -> None:
         on = self.use.isChecked()
         for widget in (self.name, self.unit, self.where, self.scale, self.bias):
@@ -104,23 +131,33 @@ class _Row:
 
 
 class IdentifyDialog(QDialog):
-    """Presents every channel's ranked candidates for naming."""
+    """Presents every channel's ranked candidates for naming.
 
-    def __init__(self, analysis: FlowAnalysis, parent=None) -> None:
+    The values update while the dialog is open. Identification is really a
+    matching exercise — the instrument's own software is showing a number on
+    screen, and the question is which candidate tracks it — and that is far
+    easier against a moving value than a frozen snapshot.
+    """
+
+    def __init__(self, analysis: FlowAnalysis, parent=None, refresh=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Identify the signals")
-        self.resize(1240, 640)
+        self.resize(1340, 660)
         self._analysis = analysis
         self._rows: List[_Row] = []
+        # Returns a fresh FlowAnalysis from the ongoing capture, or None when
+        # the dialog is opened against a finished one.
+        self._refresh = refresh
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self._summary_label())
+        self._summary = self._summary_label()
+        layout.addWidget(self._summary)
 
         self._table = QTableWidget(self)
-        self._table.setColumnCount(9)
+        self._table.setColumnCount(10)
         self._table.setHorizontalHeaderLabels(
-            ["Use", "Channel", "Read from", "Shape", "Range", "Name", "Unit",
-             "Scale", "Offset"]
+            ["Use", "Channel", "Read from", "Shape", "Live", "Range", "Name",
+             "Unit", "Scale", "Offset"]
         )
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
@@ -138,16 +175,24 @@ class IdentifyDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        if self._refresh is not None:
+            self._timer = QTimer(self)
+            self._timer.timeout.connect(self._tick)
+            self._timer.start(LIVE_REFRESH_MS)
+
     # ----- construction --------------------------------------------------
 
-    def _summary_label(self) -> QWidget:
+    def _summary_text(self) -> str:
         spec = self._analysis.request_spec
         bits = [
             f"<b>{len(self._analysis.channels)}</b> channel(s) found",
             f"framing: {spec.describe() if spec else 'unknown'}",
             f"interaction: {self._analysis.interaction.replace('_', '/')}",
         ]
-        text = " &nbsp;·&nbsp; ".join(bits)
+        return " &nbsp;·&nbsp; ".join(bits)
+
+    def _summary_label(self) -> QWidget:
+        text = self._summary_text()
         if self._analysis.warnings:
             text += "<br><span style='color:#a04000'>" + "<br>".join(
                 self._analysis.warnings
@@ -189,12 +234,17 @@ class IdentifyDialog(QDialog):
                 )
                 self._table.setItem(row, COL_CHANNEL, channel_cell)
                 self._table.setCellWidget(row, COL_WHERE, widgets.where)
-                self._table.setCellWidget(
-                    row, COL_TRACE, sparkline(candidate.preview)
-                )
-                self._table.setItem(row, COL_RANGE, QTableWidgetItem(
-                    _range_text(candidate)
-                ))
+                widgets.trace = sparkline(candidate.preview)
+                self._table.setCellWidget(row, COL_TRACE, widgets.trace)
+
+                live = QTableWidgetItem(_format_value(candidate.latest))
+                live.setFont(_monospace())
+                self._table.setItem(row, COL_LIVE, live)
+                widgets.live_item = live
+
+                range_item = QTableWidgetItem(_range_text(candidate))
+                self._table.setItem(row, COL_RANGE, range_item)
+                widgets.range_item = range_item
                 self._table.setCellWidget(row, COL_NAME, widgets.name)
                 self._table.setCellWidget(row, COL_UNIT, widgets.unit)
                 self._table.setCellWidget(row, COL_SCALE, widgets.scale)
@@ -210,8 +260,9 @@ class IdentifyDialog(QDialog):
             (COL_USE, 42),
             (COL_CHANNEL, 118),
             (COL_WHERE, 152),
-            (COL_TRACE, 150),
-            (COL_RANGE, 148),
+            (COL_TRACE, 140),
+            (COL_LIVE, 96),
+            (COL_RANGE, 178),
             (COL_UNIT, 72),
             (COL_SCALE, 92),
             (COL_BIAS, 92),
@@ -220,6 +271,62 @@ class IdentifyDialog(QDialog):
         self._table.horizontalHeader().setSectionResizeMode(
             COL_NAME, QHeaderView.Stretch
         )
+
+    # ----- live refresh ---------------------------------------------------
+
+    def _tick(self) -> None:
+        """Re-read the chosen field of every row from the latest traffic.
+
+        Only the selected (offset, encoding) of each row is decoded, not the
+        whole candidate sweep. Re-scanning every encoding at every offset once a
+        second would be wasteful, and worse, it could re-rank the rows under the
+        user's cursor while they are filling them in.
+        """
+        if self._refresh is None:
+            return
+        try:
+            analysis = self._refresh()
+        except Exception:
+            return
+        if analysis is None or not analysis.channels:
+            return
+
+        by_signature = {c.signature: c for c in analysis.channels}
+        for row in self._rows:
+            channel = by_signature.get(row.channel.signature)
+            if channel is None or not channel.payloads:
+                continue
+            offset, encoding = row.field()
+            values = decode_field(channel.payloads, offset, encoding)
+            finite = [float(v) for v in values if v == v]
+            if not finite:
+                continue
+
+            if row.live_item is not None:
+                row.live_item.setText(_format_value(finite[-1]))
+            if row.range_item is not None:
+                row.range_item.setText(
+                    f"{min(finite):.6g} … {max(finite):.6g}"
+                    if min(finite) != max(finite)
+                    else f"{finite[-1]:.6g} (constant)"
+                )
+            if row.trace is not None:
+                row.trace.clear()
+                tail = finite[-200:]
+                row.trace.plot(
+                    range(len(tail)), tail, pen=pg.mkPen("#1f77b4", width=1.5)
+                )
+
+        total = sum(c.count for c in analysis.channels)
+        self._summary.setText(
+            self._summary_text() + f" &nbsp;·&nbsp; <b>{total}</b> replies so far"
+        )
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        timer = getattr(self, "_timer", None)
+        if timer is not None:
+            timer.stop()
+        super().closeEvent(event)
 
     # ----- result --------------------------------------------------------
 
@@ -275,3 +382,14 @@ def _range_text(candidate: Candidate) -> str:
         return f"{candidate.latest:.6g} (constant)"
     note = " (counter)" if candidate.is_counter else ""
     return f"{candidate.minimum:.6g} … {candidate.maximum:.6g}{note}"
+
+
+def _monospace() -> QFont:
+    """A fixed-width font so a changing value does not jitter sideways."""
+    font = QFont("Menlo")
+    font.setStyleHint(QFont.Monospace)
+    return font
+
+
+def _format_value(value: float) -> str:
+    return f"{value:.6g}"

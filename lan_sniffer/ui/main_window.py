@@ -81,6 +81,8 @@ class MainWindow(QMainWindow):
         self._request_carry = bytearray()
         self._output_dir = Path.home() / "LAN Sniffer Sessions"
         self._session_started: Optional[float] = None
+        self._survey_raw: Optional[RawWriter] = None
+        self._survey_base: Optional[Path] = None
 
         self._build_ui()
         self._build_menu()
@@ -189,10 +191,18 @@ class MainWindow(QMainWindow):
         self._calibrate_btn = QPushButton("Teach idle vs running…")
         self._calibrate_btn.clicked.connect(self._calibrate)
 
+        self._import_btn = QPushButton("Import profile\u2026")
+        self._import_btn.clicked.connect(self._import_profile)
+        self._import_btn.setToolTip(
+            "Load a profile JSON written elsewhere \u2014 by hand, or by "
+            "something\nthat analysed a survey export."
+        )
+
         setup_group = QGroupBox("Set up a device")
         setup = QVBoxLayout(setup_group)
         setup.addWidget(self._identify_btn)
         setup.addWidget(self._calibrate_btn)
+        setup.addWidget(self._import_btn)
 
         self._session_label = QLabel("No session.")
         self._session_label.setWordWrap(True)
@@ -210,7 +220,18 @@ class MainWindow(QMainWindow):
 
         session_group = QGroupBox("Recording")
         session = QVBoxLayout(session_group)
+        self._survey_btn = QPushButton("Record everything (no profile)")
+        self._survey_btn.setCheckable(True)
+        self._survey_btn.clicked.connect(self._toggle_survey)
+        self._survey_btn.setToolTip(
+            "Record an unidentified device: every reading the scan finds "
+            "plausible,\nwith wall-clock timestamps and the raw reply bytes.\n\n"
+            "Produces a CSV and a companion JSON for analysis elsewhere \u2014 pair "
+            "it\nwith the instrument software's own export of the same run."
+        )
+
         session.addWidget(self._session_label)
+        session.addWidget(self._survey_btn)
         session.addWidget(self._start_btn)
         session.addWidget(self._stop_btn)
         session.addWidget(self._split_btn)
@@ -378,6 +399,8 @@ class MainWindow(QMainWindow):
     def _stop_capture(self) -> None:
         self._poll_timer.stop()
         self._redraw_timer.stop()
+        if self._survey_raw is not None:
+            self._finish_survey()
         self._close_session(manual=True)
         if self._pump is not None:
             self._pump.stop()
@@ -395,6 +418,8 @@ class MainWindow(QMainWindow):
             self._handle_requests(chunks)
             if self._raw is not None:
                 self._raw.add(chunks)
+            if self._survey_raw is not None:
+                self._survey_raw.add(chunks)
             if self._decoder is not None:
                 for sample in self._decoder.feed(chunks):
                     self._live.add(sample.ts, sample.values)
@@ -406,9 +431,10 @@ class MainWindow(QMainWindow):
             if event == "stop":
                 self._close_session()
 
-        self.statusBar().showMessage(
-            f"{self._pump.status()} · {len(self._analysis_buffer)} chunks buffered"
-        )
+        status = f"{self._pump.status()} · {len(self._analysis_buffer)} chunks buffered"
+        if self._survey_raw is not None:
+            status += f" · survey: {self._survey_raw.chunks_written} chunks recorded"
+        self.statusBar().showMessage(status)
         self._update_session_label()
 
     def _handle_requests(self, chunks: List[StreamChunk]) -> None:
@@ -480,7 +506,15 @@ class MainWindow(QMainWindow):
             )
             return
 
-        dialog = IdentifyDialog(analysis, self)
+        def refresh():
+            # Re-analyse the buffer as it grows, so the dialog's values track
+            # the instrument while the user is looking at them.
+            flows = group_chunks_by_flow(self._analysis_buffer)
+            if not flows:
+                return None
+            return analyze_flow(max(flows.values(), key=len))
+
+        dialog = IdentifyDialog(analysis, self, refresh=refresh)
         if dialog.exec_() != IdentifyDialog.Accepted:
             return
 
@@ -554,6 +588,176 @@ class MainWindow(QMainWindow):
             self, "Calibration saved", dialog.result.explanation
         )
         self._update_controls()
+
+    # ----- survey recording -----------------------------------------------
+
+    def _toggle_survey(self) -> None:
+        if self._survey_raw is not None:
+            self._finish_survey()
+        else:
+            self._begin_survey()
+
+    def _begin_survey(self) -> None:
+        """Record an unidentified device to the raw sidecar.
+
+        Only raw bytes are written while recording. The survey is produced from
+        that file at the end rather than accumulated in memory, so an
+        experiment that runs for hours costs nothing to hold and survives the
+        app being killed — the file can be converted afterwards either way.
+        """
+        if self._pump is None:
+            QMessageBox.information(
+                self,
+                "Start the capture first",
+                "There is nothing to record until the capture is running.",
+            )
+            self._survey_btn.setChecked(False)
+            return
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        ip = self._selected_ip() or "device"
+        self._survey_base = self._output_dir / f"survey_{_slug(ip)}_{stamp}"
+        self._survey_raw = RawWriter(
+            Path(str(self._survey_base) + ".raw.jsonl"),
+            device_ip=self._selected_ip(),
+            device_port=self._port.value() or None,
+            note="survey recording (no profile)",
+        )
+        self._survey_btn.setChecked(True)
+        self._survey_btn.setText("Stop and export survey")
+        self.statusBar().showMessage(
+            f"Recording everything to {self._survey_base.name}.raw.jsonl", 8000
+        )
+        self._update_controls()
+
+    def _finish_survey(self) -> None:
+        from ..writers.raw_writer import read_raw
+        from ..writers.survey import build_survey, write_survey
+
+        raw, self._survey_raw = self._survey_raw, None
+        base, self._survey_base = self._survey_base, None
+        self._survey_btn.setChecked(False)
+        self._survey_btn.setText("Record everything (no profile)")
+        if raw is None or base is None:
+            return
+
+        path = raw.path
+        chunks_written = raw.chunks_written
+        raw.close()
+        self._update_controls()
+
+        if not chunks_written:
+            QMessageBox.warning(
+                self,
+                "Nothing was recorded",
+                "No traffic reached the recorder. Check that the right device "
+                "and interface are selected and that the instrument software "
+                "is actually polling.",
+            )
+            return
+
+        try:
+            survey = build_survey(list(read_raw(path)))
+            csv_path, json_path = write_survey(
+                survey,
+                Path(str(base) + ".csv"),
+                device_ip=self._selected_ip(),
+                device_port=self._port.value() or None,
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Could not build the survey",
+                f"{e}\n\nThe raw capture is intact at:\n{path}\nNothing was lost; "
+                "it can be converted again.",
+            )
+            return
+
+        if not survey.columns:
+            QMessageBox.warning(
+                self,
+                "No readings found",
+                "The traffic was recorded but no request/reply pattern emerged, "
+                "so there are no columns to export.\n\n"
+                + ("\n".join(survey.warnings) or "")
+                + f"\n\nThe raw capture is at:\n{path}",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Survey exported",
+            f"{len(survey.columns)} column(s) over {len(survey.samples)} "
+            f"reading(s).\n\n"
+            f"Data:      {csv_path.name}\n"
+            f"Metadata:  {json_path.name}\n"
+            f"Raw bytes: {path.name}\n\n"
+            f"In {csv_path.parent}\n\n"
+            "Hand the CSV and the JSON to whoever is identifying the signals, "
+            "along with the instrument software's own export of the same run — "
+            "lining the two up on the clock is what identifies the columns and "
+            "shows where the experiment started. The JSON describes the config "
+            "format to hand back.",
+        )
+
+    # ----- profile import -------------------------------------------------
+
+    def _import_profile(self) -> None:
+        """Load a profile written outside the app, refusing a broken one."""
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Import a profile", str(self._output_dir), "Profile JSON (*.json)"
+        )
+        if not path:
+            return
+
+        try:
+            profile = DeviceProfile.load(Path(path))
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Could not read that profile",
+                f"{e}\n\nA profile is the JSON described under 'profile_schema' "
+                "in a survey export.",
+            )
+            return
+
+        problems = profile.validate()
+        if problems:
+            shown = "\n".join(f"  •  {p}" for p in problems[:12])
+            if len(problems) > 12:
+                shown += f"\n  …and {len(problems) - 12} more."
+            QMessageBox.critical(
+                self,
+                "That profile has problems",
+                f"{len(problems)} problem(s) found, so it was not imported:\n\n"
+                f"{shown}\n\nMost of these would decode to plausible-looking "
+                "numbers rather than failing, so the file is refused rather "
+                "than half-applied.",
+            )
+            return
+
+        destination = PROFILE_DIR / f"{_slug(profile.name)}.json"
+        if destination.exists():
+            reply = QMessageBox.question(
+                self,
+                "Replace the existing profile?",
+                f"A profile named '{profile.name}' already exists and will be "
+                "overwritten.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        profile.save(destination)
+        self._refresh_profiles(select=profile.name)
+        QMessageBox.information(
+            self,
+            "Profile imported",
+            f"'{profile.name}' is ready, with {len(profile.signals)} signal(s): "
+            + ", ".join(profile.signal_names)
+            + ".\n\nStart a session to record with it.",
+        )
 
     # ----- sessions -------------------------------------------------------
 
@@ -644,6 +848,7 @@ class MainWindow(QMainWindow):
     def _update_controls(self) -> None:
         capturing = self._pump is not None
         recording = self._csv is not None
+        self._survey_btn.setEnabled(capturing)
         self._identify_btn.setEnabled(capturing)
         self._calibrate_btn.setEnabled(capturing)
         self._start_btn.setEnabled(capturing and not recording and self._profile is not None)

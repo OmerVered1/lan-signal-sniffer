@@ -89,9 +89,12 @@ plenty. Nothing is recorded yet.
 
 **3. Identify signals.** The scan splits the traffic into channels, sweeps every
 byte offset against every plausible encoding, and ranks what it finds. Each row
-shows the evidence: the shape of the trace, the value range, where the bytes sit.
-Tick the ones that are real, name them, give them units, and save. The name
-becomes the CSV column heading.
+shows the evidence: the shape of the trace, the value range, where the bytes sit,
+and a **Live** column that keeps updating while the dialog is open. Identifying a
+signal is really a matching exercise — the instrument's own software is showing a
+number on screen, and the question is which candidate tracks it — so watch the
+live value rather than a frozen snapshot. Tick the real ones, name them, give
+them units, and save. The name becomes the CSV column heading.
 
 The ranking is a suggestion. Every accepted candidate carries the overlapping
 readings it outranked, offered in the *Read from* dropdown, so a wrong pick is
@@ -105,6 +108,28 @@ fires at random; recording still works from the buttons.
 
 **5. Leave it running.** Sessions open and close on their own, and *Start*,
 *Stop* and *Split here* are always available.
+
+## When you can't identify it yourself
+
+Some instruments will not give up their layout to a scan and a sparkline. For
+those, **Record everything (no profile)** writes down every reading the scan
+finds plausible — including the ones it ranked poorly — with wall-clock
+timestamps and the untouched reply bytes alongside.
+
+Stopping it produces two files: a wide CSV of the data, and a JSON describing
+the channels, the framing, what each column means, and the config format to hand
+back.
+
+Give both to whoever is doing the identifying, **together with the instrument
+software's own export of the same run**. That pairing is what makes it solvable:
+lining the two up on the clock identifies which column is which quantity, and
+shows where the experiment started. Neither is derivable from the bytes alone,
+which is why the app does not pretend to know.
+
+What comes back is a profile JSON. Load it with **Import profile…** — it is
+validated on the way in, and refused with a specific list of problems if
+anything is wrong, because most mistakes here decode to plausible-looking
+numbers rather than failing outright.
 
 ## What a session produces
 

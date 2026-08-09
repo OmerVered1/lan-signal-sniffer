@@ -42,7 +42,7 @@ class SessionCSVWriter:
 
     _handle: Optional[TextIO] = None
     _writer: Optional[object] = None
-    _row: Dict[str, float] = field(default_factory=dict)
+    _row: Dict[str, object] = field(default_factory=dict)
     _row_ts: Optional[float] = None
     _t0: Optional[float] = None
     rows_written: int = 0
@@ -60,7 +60,7 @@ class SessionCSVWriter:
 
     # ----- input ---------------------------------------------------------
 
-    def add(self, ts: float, values: Dict[str, float]) -> None:
+    def add(self, ts: float, values: Dict[str, object]) -> None:
         """Fold one decoded sample into the open row."""
         if self._t0 is None:
             self._t0 = ts
@@ -101,7 +101,14 @@ class SessionCSVWriter:
         row = [f"{stamp}.{int(fractional * 1000):03d}", f"{elapsed:.3f}"]
         for name in self.signal_names:
             value = self._row.get(name)
-            row.append("" if value is None else f"{value:.9g}")
+            if value is None:
+                row.append("")
+            elif isinstance(value, str):
+                # The survey export carries raw reply bytes as hex alongside the
+                # decoded columns, so not every cell is a number.
+                row.append(value)
+            else:
+                row.append(f"{value:.9g}")
         self._writer.writerow(row)
         if self._handle is not None:
             self._handle.flush()

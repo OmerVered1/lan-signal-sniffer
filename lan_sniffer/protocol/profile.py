@@ -146,6 +146,104 @@ class DeviceProfile:
 
     # ----- lookup -------------------------------------------------------
 
+    def validate(self) -> List[str]:
+        """Return every problem found, as sentences a person can act on.
+
+        Profiles can arrive from outside the app — hand-edited, or written by
+        something analysing a survey export — so they cannot be assumed
+        well-formed. Most mistakes here decode to plausible-looking numbers
+        rather than raising, so an unchecked profile produces a CSV full of
+        wrong values that looks entirely normal. Every problem is collected
+        rather than raising on the first, since fixing them one round-trip at a
+        time is miserable.
+        """
+        from .fields import ENCODINGS
+
+        known = {name for name, _dt, _size, _f in ENCODINGS}
+        problems: List[str] = []
+
+        if not self.name.strip():
+            problems.append("The profile needs a name.")
+        if not 0 <= self.device_port <= 65535:
+            problems.append(
+                f"device_port is {self.device_port}; it must be between 0 and 65535."
+            )
+        if self.interaction not in ("request_response", "server_push"):
+            problems.append(
+                f"interaction is {self.interaction!r}; expected "
+                "'request_response' or 'server_push'."
+            )
+        if not self.signals:
+            problems.append("The profile defines no signals, so it would record nothing.")
+
+        seen: Dict[str, int] = {}
+        for i, signal in enumerate(self.signals):
+            where = f"signal {i + 1}"
+            if signal.name.strip():
+                where = f"signal {i + 1} ({signal.name})"
+            else:
+                problems.append(f"{where} has no name; the name becomes a CSV column.")
+
+            seen[signal.name] = seen.get(signal.name, 0) + 1
+
+            if signal.encoding.startswith("ascii#"):
+                index = signal.encoding.split("#", 1)[1]
+                if not index.isdigit():
+                    problems.append(
+                        f"{where}: encoding {signal.encoding!r} should be "
+                        "'ascii#N' where N is which number in the reply to take."
+                    )
+            elif signal.encoding not in known:
+                problems.append(
+                    f"{where}: encoding {signal.encoding!r} is not one of "
+                    + ", ".join(sorted(known))
+                    + ", or ascii#N."
+                )
+
+            if signal.offset < 0:
+                problems.append(f"{where}: offset {signal.offset} cannot be negative.")
+
+            if signal.mask and len(signal.mask) != len(signal.signature):
+                problems.append(
+                    f"{where}: mask has {len(signal.mask)} entries but the "
+                    f"request is {len(signal.signature)} bytes; they must match "
+                    "one-to-one."
+                )
+
+            if self.interaction == "request_response" and not signal.signature:
+                problems.append(
+                    f"{where}: no request signature. A request/response device "
+                    "needs to know which request this signal answers — copy it "
+                    "from the channel's request_hex."
+                )
+            if self.interaction == "server_push" and signal.signature:
+                problems.append(
+                    f"{where}: has a request signature, but this profile is "
+                    "marked 'server_push', where readings arrive unprompted. "
+                    "Leave the signature empty or switch to 'request_response'."
+                )
+
+            if signal.scale == 0:
+                problems.append(
+                    f"{where}: scale is 0, which would record every reading as "
+                    f"{signal.bias}."
+                )
+
+        for name, count in seen.items():
+            if count > 1 and name.strip():
+                problems.append(
+                    f"The name {name!r} is used {count} times; each signal needs "
+                    "its own CSV column."
+                )
+
+        if self.interaction == "server_push" and self.response_framing is None:
+            problems.append(
+                "A 'server_push' profile needs 'response_framing', since there "
+                "are no requests to delimit the replies."
+            )
+
+        return problems
+
     def signals_for(self, request: bytes) -> List[SignalSpec]:
         return [s for s in self.signals if s.matches(request)]
 

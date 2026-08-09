@@ -191,7 +191,10 @@ def score_series(values: np.ndarray, is_float: bool, width: int) -> Optional[dic
         order = np.argsort(counts)[::-1]
         for idx in order[:2]:
             if steps[idx] != 0:
-                is_counter = counts[idx] / diffs.size >= COUNTER_AGREEMENT
+                # bool() rather than the numpy scalar the comparison yields:
+                # np.bool_ behaves like a bool everywhere except JSON, where it
+                # fails at serialisation time, far from here.
+                is_counter = bool(counts[idx] / diffs.size >= COUNTER_AGREEMENT)
                 break
 
     # Smoothness: how far the signal moves per sample compared with the range it
@@ -254,8 +257,8 @@ def score_series(values: np.ndarray, is_float: bool, width: int) -> Optional[dic
         score *= 0.35
 
     return {
-        "score": score,
-        "is_constant": is_constant,
+        "score": float(score),
+        "is_constant": bool(is_constant),
         "is_counter": is_counter,
         "minimum": vmin,
         "maximum": vmax,
