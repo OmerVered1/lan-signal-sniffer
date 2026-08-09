@@ -11,6 +11,7 @@ from collections import deque
 from typing import Deque, Dict, List, Sequence
 
 import pyqtgraph as pg
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QCheckBox, QHBoxLayout, QVBoxLayout, QWidget
 
 # Points kept per signal. At one sample a second this is a bit over two hours,
@@ -43,6 +44,7 @@ class LiveView(QWidget):
         self._values: Dict[str, Deque[float]] = {}
         self._curves: Dict[str, pg.PlotDataItem] = {}
         self._boxes: Dict[str, QCheckBox] = {}
+        self._markers: List = []
 
         pg.setConfigOptions(antialias=True)
         self._plot = pg.PlotWidget()
@@ -92,6 +94,32 @@ class LiveView(QWidget):
             self._times[name].clear()
             self._values[name].clear()
             self._curves[name].setData([], [])
+        for marker in getattr(self, "_markers", []):
+            self._plot.removeItem(marker)
+        self._markers = []
+
+    def mark_session(self, ts: float, kind: str) -> None:
+        """Draw where a session opened or closed.
+
+        Recording state is otherwise invisible on the trace: the plot looks
+        identical whether or not anything is being written to disk. A line on
+        the data itself is the one place the answer cannot be missed while
+        watching the run.
+        """
+        if self._t0 is None:
+            self._t0 = ts
+        colour = "#1a7f37" if kind == "start" else "#a04000"
+        line = pg.InfiniteLine(
+            pos=ts - self._t0,
+            angle=90,
+            pen=pg.mkPen(colour, width=2, style=Qt.DashLine),
+            label="REC start" if kind == "start" else "REC stop",
+            labelOpts={"position": 0.92, "color": colour, "fill": "#ffffffc0"},
+        )
+        self._plot.addItem(line)
+        if not hasattr(self, "_markers"):
+            self._markers = []
+        self._markers.append(line)
 
     # ----- data ----------------------------------------------------------
 

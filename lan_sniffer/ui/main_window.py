@@ -212,8 +212,18 @@ class MainWindow(QMainWindow):
         setup.addWidget(self._calibrate_btn)
         setup.addWidget(self._import_btn)
 
+        self._banner = QLabel("\u25cb  NOT RECORDING")
+        self._banner.setAlignment(Qt.AlignCenter)
+        self._banner.setStyleSheet(
+            "background:#e8e8e8; color:#555; font-weight:bold; font-size:15px; "
+            "padding:9px; border-radius:4px;"
+        )
+
         self._session_label = QLabel("No session.")
         self._session_label.setWordWrap(True)
+        self._session_label.setTextFormat(Qt.RichText)
+        self._session_label.setStyleSheet("color:#555; font-size:11px;")
+        self._session_label.setMinimumHeight(46)
         self._start_btn = QPushButton("Start session")
         self._stop_btn = QPushButton("Stop session")
         self._split_btn = QPushButton("Split here")
@@ -238,6 +248,7 @@ class MainWindow(QMainWindow):
             "it\nwith the instrument software's own export of the same run."
         )
 
+        session.addWidget(self._banner)
         session.addWidget(self._session_label)
         session.addWidget(self._survey_btn)
         session.addWidget(self._start_btn)
@@ -794,7 +805,7 @@ class MainWindow(QMainWindow):
             note=f"profile: {self._profile.name}",
         )
         self._session_started = time.time()
-        self._live.clear()
+        self._live.mark_session(self._session_started, "start")
         if manual and self._detector is not None:
             self._detector.start(time.time())
         self.statusBar().showMessage(f"Recording to {base.name}.csv", 8000)
@@ -807,6 +818,7 @@ class MainWindow(QMainWindow):
                 self._csv.add(tail.ts, tail.values)
         if self._csv is not None:
             rows = self._csv.rows_written
+            self._live.mark_session(time.time(), "stop")
             self._csv.close()
             self.statusBar().showMessage(f"Session closed — {rows} row(s).", 8000)
         self._csv = None
@@ -836,22 +848,70 @@ class MainWindow(QMainWindow):
     # ----- state ----------------------------------------------------------
 
     def _update_session_label(self) -> None:
+        """Make the recording state impossible to misread, and say why if not.
+
+        A quiet line of text was not enough: with the plot drawing either way,
+        "waiting" and "recording" looked the same at a glance, and a run could
+        be missed entirely without anything drawing attention to it.
+        """
         if self._csv is not None and self._session_started is not None:
             elapsed = int(time.time() - self._session_started)
-            self._session_label.setText(
-                f"<b style='color:#1a7f37'>Recording</b> — {elapsed // 60} min "
-                f"{elapsed % 60} s, {self._csv.rows_written} row(s)."
+            self._banner.setText(
+                f"⏺  RECORDING   {elapsed // 60:d}:{elapsed % 60:02d}   ·   "
+                f"{self._csv.rows_written} rows"
             )
-        elif self._detector is not None and self._detector.calibration.automatic:
-            self._session_label.setText(
-                "Waiting — a session will start on its own when an experiment "
-                f"begins ({self._detector.calibration.mode} detection)."
+            self._banner.setStyleSheet(
+                "background:#1a7f37; color:white; font-weight:bold; "
+                "font-size:15px; padding:9px; border-radius:4px;"
             )
+            self._session_label.setText(
+                f"Writing to <code>{Path(self._csv.path).name}</code>"
+            )
+            return
+
+        detector = self._detector
+        automatic = detector is not None and detector.calibration.automatic
+        self._banner.setText("○  NOT RECORDING" + ("   ·   armed" if automatic else ""))
+        self._banner.setStyleSheet(
+            "background:#e8e8e8; color:#555; font-weight:bold; font-size:15px; "
+            "padding:9px; border-radius:4px;"
+        )
+
+        if not automatic:
+            self._session_label.setText(
+                "This device has no automatic detection, so start and stop "
+                "recording by hand."
+            )
+            return
+
+        # Armed but idle. The two reasons a run can be missed — the capture
+        # started after the run did, or the instrument sent a different command
+        # — are indistinguishable without this.
+        cal = detector.calibration
+        trigger = ", ".join(cal.trigger_signatures) or "?"
+        if detector.last_trigger_ts is not None:
+            ago = int(time.time() - detector.last_trigger_ts)
+            state = f"start command last seen {ago} s ago"
         else:
-            self._session_label.setText(
-                "No session. This device has no automatic detection, so start "
-                "and stop recording by hand."
+            state = "<b>start command not seen yet</b>"
+
+        lines = [f"{detector.observed} requests · {state}"]
+        if detector.observed > 200 and detector.last_trigger_ts is None:
+            lines.append(
+                "<span style='color:#a04000'>Run already going? Its start "
+                "command came before this capture — press Start session.</span>"
             )
+        self._session_label.setText("<br>".join(lines))
+
+        # The full picture goes in the tooltip: useful when a run is missed,
+        # noise in the panel the rest of the time.
+        detail = [f"Waiting for: {trigger}", f"Stops on: {', '.join(cal.stop_signatures) or 'a quiet period'}"]
+        if detector.near_misses:
+            detail.append(
+                "Similar commands seen from the same family:\n  "
+                + "\n  ".join(detector.near_misses)
+            )
+        self._session_label.setToolTip("\n".join(detail))
 
     def _update_controls(self) -> None:
         capturing = self._pump is not None

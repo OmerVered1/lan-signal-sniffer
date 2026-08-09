@@ -268,6 +268,42 @@ class SessionDetector:
         self._last_positive: Optional[float] = None
         self._manual_override = False
 
+        # Diagnostics. When a session fails to start there is nothing on screen
+        # to say why, and the two likely causes — the capture began after the
+        # run did, or the instrument sent a variant of the expected command —
+        # look identical from the outside. These make them distinguishable.
+        self.observed = 0
+        self.last_trigger_ts: Optional[float] = None
+        self.last_stop_ts: Optional[float] = None
+        self.near_misses: Deque[str] = deque(maxlen=8)
+
+    @property
+    def trigger_prefixes(self) -> List[str]:
+        """Command families the triggers belong to.
+
+        A near miss is a request from the same family as a trigger but with a
+        different value — exactly what a differing firmware or a second control
+        register would produce, and worth showing rather than discarding.
+        """
+        prefixes = set()
+        for sig in list(self._cal.trigger_signatures) + list(self._cal.stop_signatures):
+            if len(sig) > 4:
+                prefixes.add(sig[:-2])
+        return sorted(prefixes)
+
+    def _note(self, obs: Observation) -> None:
+        self.observed += 1
+        if obs.signature in self._cal.trigger_signatures:
+            self.last_trigger_ts = obs.ts
+            return
+        if obs.signature in self._cal.stop_signatures:
+            self.last_stop_ts = obs.ts
+            return
+        for prefix in self.trigger_prefixes:
+            if obs.signature.startswith(prefix) and obs.signature not in self.near_misses:
+                self.near_misses.append(obs.signature)
+                break
+
     @property
     def running(self) -> bool:
         return self._running
@@ -278,6 +314,7 @@ class SessionDetector:
 
     def observe(self, obs: Observation) -> Optional[str]:
         """Report one request. Returns "start", "stop", or None."""
+        self._note(obs)
         self._recent.append(obs.ts)
         while self._recent and obs.ts - self._recent[0] > self._window:
             self._recent.popleft()

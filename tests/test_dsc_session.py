@@ -238,3 +238,59 @@ def test_dsc_profile_does_not_reuse_the_c80_commands():
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ----- diagnostics when a run is missed -------------------------------------
+
+
+def test_detector_reports_never_having_seen_the_trigger():
+    """Distinguishes "capture started late" from "wrong command".
+
+    Both look identical from outside — nothing recording, an experiment
+    running — and without this there is nothing on screen to tell them apart.
+    """
+    det = SessionDetector(dsc_calibration())
+    for i in range(400):
+        det.observe(Observation(float(i), IDLE_POLL))
+    assert det.observed == 400
+    assert det.last_trigger_ts is None
+    assert not det.running
+
+
+def test_detector_remembers_when_the_trigger_last_fired():
+    det = SessionDetector(dsc_calibration())
+    det.observe(Observation(20.0, START_CMD))
+    assert det.last_trigger_ts == 20.0
+    det.observe(Observation(920.0, STOP_CMD))
+    assert det.last_stop_ts == 920.0
+
+
+def test_commands_from_the_trigger_family_are_kept_as_near_misses():
+    """A variant of the control command is the likely cause of a missed run.
+
+    0004 0001 0000 0c and ...18 are sent around a run alongside ...05. Seeing
+    them arrive while ...05 never does is the evidence that the register is
+    right and the value is not.
+    """
+    det = SessionDetector(dsc_calibration())
+    det.observe(Observation(1.0, "0004000100000c"))
+    det.observe(Observation(2.0, "00040001000018"))
+    det.observe(Observation(3.0, IDLE_POLL))
+    assert list(det.near_misses) == ["0004000100000c", "00040001000018"]
+    assert IDLE_POLL not in det.near_misses, "unrelated polling is not a near miss"
+
+
+def test_near_misses_are_deduplicated_and_bounded():
+    det = SessionDetector(dsc_calibration())
+    for _ in range(50):
+        det.observe(Observation(1.0, "0004000100000c"))
+    assert list(det.near_misses) == ["0004000100000c"]
+    for i in range(20):
+        det.observe(Observation(float(i), "00040001%04x" % i))
+    assert len(det.near_misses) <= 8, "the panel shows a few, not a log"
+
+
+def test_the_trigger_itself_is_not_listed_as_a_near_miss():
+    det = SessionDetector(dsc_calibration())
+    det.observe(Observation(1.0, START_CMD))
+    assert START_CMD not in det.near_misses
