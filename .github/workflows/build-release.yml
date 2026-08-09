@@ -22,8 +22,13 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install test dependencies
-        run: pip install numpy pytest
+        # PyQt5 included so the window-level tests actually run. Without it
+        # they skip, and the seam between detector and UI — where the
+        # session-never-stops bug lived — goes unchecked in CI.
+        run: pip install numpy pytest PyQt5 pyqtgraph
       - name: Run the suite
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python -m pytest tests/ -q
 
   build-windows:

@@ -467,8 +467,15 @@ class MainWindow(QMainWindow):
                 self._request_sink.append((frame_ts, frame))
             if self._detector is not None:
                 signature = self._detector.calibration.signature_of(frame)
-                if self._detector.observe(Observation(frame_ts, signature)) == "start":
+                # Both outcomes have to be acted on. Acting only on "start" left
+                # the stop command decoded, reported, and ignored — and since
+                # tick() deliberately withholds the quiet timeout whenever a
+                # stop command exists, nothing else could ever end the session.
+                event = self._detector.observe(Observation(frame_ts, signature))
+                if event == "start":
                     self._open_session()
+                elif event == "stop":
+                    self._close_session()
 
     def _iter_requests(self, chunks: List[StreamChunk]):
         """Split client segments into request frames, carrying partials over."""
@@ -795,7 +802,7 @@ class MainWindow(QMainWindow):
             return
 
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        base = self._output_dir / f"{_slug(self._profile.name)}_{stamp}"
+        base = _unclaimed(self._output_dir / f"{_slug(self._profile.name)}_{stamp}")
         units = {s.name: s.unit for s in self._profile.signals}
         try:
             self._csv = SessionCSVWriter(
@@ -944,6 +951,24 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         self._stop_capture()
         super().closeEvent(event)
+
+
+def _unclaimed(base: Path) -> Path:
+    """Add a counter if this session name is already taken.
+
+    Session files are named to the second. Two sessions can begin inside the
+    same second — Split here, or a run stopped and restarted quickly — and
+    without this the second one silently overwrites the first, destroying a
+    recording with nothing to indicate it happened.
+    """
+    candidate = base
+    counter = 2
+    while candidate.with_suffix(".csv").exists() or Path(
+        str(candidate) + ".raw.jsonl"
+    ).exists():
+        candidate = base.with_name(f"{base.name}_{counter}")
+        counter += 1
+    return candidate
 
 
 def _slug(text: str) -> str:

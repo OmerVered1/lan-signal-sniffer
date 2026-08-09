@@ -109,7 +109,7 @@ if sys.platform == "darwin":
         icon=icon_path,
         bundle_identifier="il.ac.bgu.omervered.lansignalsniffer",
         info_plist={
-            "CFBundleShortVersionString": "0.5.1",
+            "CFBundleShortVersionString": "0.5.2",
             "NSHighResolutionCapable": True,
         },
     )
