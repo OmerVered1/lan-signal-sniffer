@@ -129,7 +129,8 @@ def test_stop_signatures_survive_the_profile_round_trip(tmp_path):
 def test_shipped_dsc_profile_is_valid():
     profile = DeviceProfile.load(PROFILE_DIR / "setaram_dsc_setline.json")
     assert profile.validate() == []
-    assert profile.signal_names == ["sample_temperature", "heat_flow"]
+    # The two Calisto exports come first; the control-loop channels follow.
+    assert profile.signal_names[:2] == ["sample_temperature", "heat_flow"]
 
 
 def test_dsc_profile_reads_both_signals_from_the_packed_status_frame():
@@ -152,6 +153,70 @@ def test_dsc_profile_reads_both_signals_from_the_packed_status_frame():
     assert samples[0].values["heat_flow"] == pytest.approx(-0.61916, abs=1e-5)
 
 
+def test_dsc_profile_records_the_control_loop_too():
+    """Furnace, setpoint, error and power, not just the two Calisto exports.
+
+    These were identified by the relation control_error + furnace ==
+    programmed_setpoint, which holds to 0.045 degC over the real run. That is
+    also what makes the furnace the furnace: the loop regulates it.
+    """
+    profile = DeviceProfile.load(PROFILE_DIR / "setaram_dsc_setline.json")
+    assert set(profile.signal_names) == {
+        "sample_temperature",
+        "heat_flow",
+        "furnace_temperature",
+        "programmed_setpoint",
+        "control_error",
+        "heater_power",
+        "heater_power_averaged",
+    }
+    by_name = {s.name: s for s in profile.signals}
+    # The setpoint is the one f64 in the set; reading it as f32 gives nonsense.
+    assert by_name["programmed_setpoint"].encoding == "f64be"
+    assert by_name["heater_power"].unit == "%"
+    assert by_name["furnace_temperature"].unit == "degC"
+
+
+def test_control_loop_signals_decode_and_satisfy_the_identity():
+    """Decode a synthetic reply set and check the algebra survives the profile.
+
+    Guards the offsets and encodings: transpose two of them and the identity
+    stops holding, which no range check on an individual signal would catch.
+    """
+    profile = DeviceProfile.load(PROFILE_DIR / "setaram_dsc_setline.json")
+    setpoint, furnace = 40.15, 38.11
+    error = setpoint - furnace
+
+    def reply_for(sig: bytes, value: float, fmt: str) -> bytes:
+        body = bytearray(b"\x00" * (6 + (8 if fmt == ">d" else 4)))
+        body[0 : len(sig)] = sig
+        struct.pack_into(fmt, body, 6, value)
+        return bytes(body)
+
+    exchanges = []
+    ts = 0.0
+    for _ in range(12):
+        for sig_hex, value, fmt in (
+            ("000100020005", furnace, ">f"),
+            ("000100100000", setpoint, ">d"),
+            ("000100020006", error, ">f"),
+        ):
+            sig = bytes.fromhex(sig_hex)
+            exchanges.append((ts, sig, ts + 0.01, reply_for(sig, value, fmt)))
+            ts += 0.1
+
+    samples = LiveDecoder(profile).feed(synth.build_capture(exchanges))
+    seen = {}
+    for s in samples:
+        seen.update(s.values)
+    assert seen["furnace_temperature"] == pytest.approx(furnace, abs=1e-4)
+    assert seen["programmed_setpoint"] == pytest.approx(setpoint, abs=1e-9)
+    assert seen["control_error"] == pytest.approx(error, abs=1e-4)
+    assert seen["control_error"] + seen["furnace_temperature"] == pytest.approx(
+        seen["programmed_setpoint"], abs=1e-3
+    )
+
+
 def test_dsc_profile_does_not_reuse_the_c80_commands():
     """A deliberate negative.
 
@@ -164,7 +229,11 @@ def test_dsc_profile_does_not_reuse_the_c80_commands():
     signatures = {s.signature.hex() for s in profile.signals}
     assert "000100080004" not in signatures
     assert "0001000a0001" not in signatures
-    assert signatures == {"0008"}
+    # Both Calisto-exported quantities must come from the packed status frame,
+    # which is the only place they were confirmed.
+    plotted = {s.signature.hex() for s in profile.signals
+               if s.name in ("sample_temperature", "heat_flow")}
+    assert plotted == {"0008"}
 
 
 if __name__ == "__main__":  # pragma: no cover

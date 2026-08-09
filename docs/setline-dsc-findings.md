@@ -69,6 +69,49 @@ The ranges look right, which is exactly what makes this a trap. They are not
 what Calisto plots. **The shipped C80 profile does not work on this instrument**
 and must not be assumed to.
 
+## The control loop
+
+Calisto exports only two columns, so at first there was nothing to check the
+other channels against. They identify each other instead: three of them satisfy
+an exact algebraic relation.
+
+    control_error  +  furnace_temperature  ==  programmed_setpoint
+
+Residual over the whole run: **0.045 °C RMS, 0.09 °C worst case** — the width of
+the values' own rounding. That single identity fixes all three at once, and it
+settles which temperature is the furnace: the PID regulates
+`000100020005` towards `000100100000`, so the regulated variable is by
+definition the furnace, not merely a sensor that happens to read higher.
+
+| Quantity | Request | Offset | Encoding | Evidence |
+|---|---|---|---|---|
+| Furnace / regulation temperature (°C) | `000100020005` | 6 | `f32be` | the regulated variable in the identity above; leads the sample by up to +4.7 K while heating, lags by −1.6 K while cooling |
+| Programmed setpoint (°C) | `000100100000` | 6 | `f64be` | the identity's target; ramps 0 → 50 → 20, matching the programme |
+| Control error (°C) | `000100020006` | 6 | `f32be` | setpoint − furnace, to 0.045 °C |
+| Heater power (%) | `000100020004` | 6 | `f32be` | **exactly** 0.00 whenever the programme is cooling, 14–16 % while ramping; r = +0.94 with dT/dt |
+| Heater power, averaged (%) | `000100020001` | 6 | `f32be` | same trace lagging the instantaneous one by ~60 s, r = 0.98 |
+
+### ΔT and what heat flow actually is
+
+ΔT is **not** a channel on the wire. Compute it:
+
+    deltaT = furnace_temperature − sample_temperature
+
+Over this run it ran **+4.7 K while heating and −1.6 K while cooling**. And the
+exported heat flow is essentially that difference, scaled:
+
+    HF(µV) = −0.9517 × deltaT − 0.2736        r = −0.9921
+
+which is what a heat-flux DSC measures, so this is a consistency check rather
+than a surprise. It also means heat flow and ΔT are not independent readings.
+
+### Not an identity
+
+`000100020000` sits at about **2 × the control error** for most of the run —
+a proportional controller term — but the relation breaks down (residual 2.5 RMS,
+50 worst case), so it is clamped or gated somewhere. Recorded as unexplained
+rather than dressed up as a law.
+
 ## Other channels, uncorroborated
 
 Correlations below are against Calisto's two exported signals. Nothing here is

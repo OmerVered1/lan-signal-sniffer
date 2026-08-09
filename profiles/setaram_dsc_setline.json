@@ -21,7 +21,10 @@
       "name": "sample_temperature",
       "unit": "degC",
       "signature": "0008",
-      "mask": [true, true],
+      "mask": [
+        true,
+        true
+      ],
       "offset": 15,
       "encoding": "f32be",
       "scale": 1.0,
@@ -31,8 +34,96 @@
       "name": "heat_flow",
       "unit": "uV",
       "signature": "0008",
-      "mask": [true, true],
+      "mask": [
+        true,
+        true
+      ],
       "offset": 19,
+      "encoding": "f32be",
+      "scale": 1.0,
+      "bias": 0.0
+    },
+    {
+      "name": "furnace_temperature",
+      "unit": "degC",
+      "signature": "000100020005",
+      "mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "offset": 6,
+      "encoding": "f32be",
+      "scale": 1.0,
+      "bias": 0.0
+    },
+    {
+      "name": "programmed_setpoint",
+      "unit": "degC",
+      "signature": "000100100000",
+      "mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "offset": 6,
+      "encoding": "f64be",
+      "scale": 1.0,
+      "bias": 0.0
+    },
+    {
+      "name": "control_error",
+      "unit": "degC",
+      "signature": "000100020006",
+      "mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "offset": 6,
+      "encoding": "f32be",
+      "scale": 1.0,
+      "bias": 0.0
+    },
+    {
+      "name": "heater_power",
+      "unit": "%",
+      "signature": "000100020004",
+      "mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "offset": 6,
+      "encoding": "f32be",
+      "scale": 1.0,
+      "bias": 0.0
+    },
+    {
+      "name": "heater_power_averaged",
+      "unit": "%",
+      "signature": "000100020001",
+      "mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "offset": 6,
       "encoding": "f32be",
       "scale": 1.0,
       "bias": 0.0
@@ -40,8 +131,12 @@
   ],
   "session": {
     "mode": "signature",
-    "trigger_signatures": ["00040001000005"],
-    "stop_signatures": ["00040001000002"],
+    "trigger_signatures": [
+      "00040001000005"
+    ],
+    "stop_signatures": [
+      "00040001000002"
+    ],
     "rate_threshold": 0.0,
     "idle_rate": 0.0,
     "running_rate": 0.0,
@@ -50,5 +145,5 @@
     "request_mask": {},
     "explanation": "Calisto writes to one control register to start and stop a run: 0004 0001 0000 05 starts, 0004 0001 0000 02 stops. Each is sent once, so start_streak is 1. There is no quiet timeout because this instrument is polled continuously between runs - the session ends on the stop command, not on silence."
   },
-  "notes": "Derived from a real capture on 2026-08-09 and cross-checked against Calisto's own export of the same run. Sample temperature and heat flow both live in the reply to the 2-byte request 0008, a packed status frame of 23 bytes, at offsets 15 and 19 as big-endian float32. Agreement with Calisto: r=0.999989 / RMSE 0.044 degC for temperature, r=0.999957 / RMSE 0.021 uV for heat flow. Note that 0008 is only polled while a run is in progress, which is what makes it safe to record continuously. The C80's own commands (000100080004, 0001000a0001) are also answered by this device and carry similar-looking values, but they do NOT track what Calisto plots (r=0.73 and r=0.50) - do not assume the C80 profile works here."
+  "notes": "Derived from a real capture on 2026-08-09 and cross-checked against Calisto's own export of the same run. Sample temperature and heat flow both live in the reply to the 2-byte request 0008, a packed status frame of 23 bytes, at offsets 15 and 19 as big-endian float32. Agreement with Calisto: r=0.999989 / RMSE 0.044 degC for temperature, r=0.999957 / RMSE 0.021 uV for heat flow. Note that 0008 is only polled while a run is in progress, which is what makes it safe to record continuously. The C80's own commands (000100080004, 0001000a0001) are also answered by this device and carry similar-looking values, but they do NOT track what Calisto plots (r=0.73 and r=0.50) - do not assume the C80 profile works here.  Control-loop channels added after a second pass. The identity control_error + furnace_temperature == programmed_setpoint holds to 0.045 degC RMS over the whole run, which is what identifies all three at once: the PID regulates furnace_temperature towards programmed_setpoint, so the regulated variable is by definition the furnace. heater_power is exactly zero whenever the programme is cooling and around 14-16% while ramping. Delta T is not a channel on the wire - compute it as furnace_temperature minus sample_temperature; over this run it ran +4.7 K while heating and -1.6 K while cooling, and heat_flow tracks it as HF = -0.95*deltaT - 0.27 (r = -0.992)."
 }
