@@ -252,18 +252,65 @@ class DeviceProfile:
         return [s.name for s in self.signals]
 
 
-def load_profiles(directory: Path) -> List[DeviceProfile]:
-    """Load every profile in a directory, skipping ones that fail to parse."""
-    out: List[DeviceProfile] = []
-    directory = Path(directory)
-    if not directory.is_dir():
-        return out
-    for path in sorted(directory.glob("*.json")):
-        try:
-            out.append(DeviceProfile.load(path))
-        except (ValueError, KeyError, json.JSONDecodeError):
+def bundled_profile_dir() -> Path:
+    """Where the profiles shipped with the app live. Read-only.
+
+    In an installed build this sits under Program Files (or inside the .app),
+    so nothing may be written here: it needs administrator rights, and the
+    installer replaces the whole directory on every update.
+    """
+    import sys
+
+    frozen = getattr(sys, "_MEIPASS", None)
+    if frozen:
+        return Path(frozen) / "profiles"
+    return Path(__file__).resolve().parents[2] / "profiles"
+
+
+def user_profile_dir() -> Path:
+    """Where profiles the user creates or imports are kept.
+
+    Deliberately outside the installation. Writing profiles next to the
+    executable loses every one of them at the next update, which is the worst
+    possible moment: the profile is what turns the app from a packet viewer
+    into an instrument recorder, and re-deriving one means repeating an
+    experiment.
+    """
+    import os
+    import sys
+
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home())
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return base / "LAN Signal Sniffer" / "profiles"
+
+
+def load_profiles(directory: Optional[Path] = None) -> List[DeviceProfile]:
+    """Load the shipped profiles and the user's own.
+
+    A user profile with the same name as a shipped one replaces it, so a
+    corrected profile survives an update that would otherwise reinstate the
+    original.
+    """
+    if directory is not None:
+        directories = [Path(directory)]
+    else:
+        directories = [bundled_profile_dir(), user_profile_dir()]
+
+    by_name: Dict[str, DeviceProfile] = {}
+    for folder in directories:
+        if not folder.is_dir():
             continue
-    return out
+        for path in sorted(folder.glob("*.json")):
+            try:
+                profile = DeviceProfile.load(path)
+            except (ValueError, KeyError, json.JSONDecodeError, OSError):
+                continue
+            by_name[profile.name] = profile
+    return [by_name[name] for name in sorted(by_name)]
 
 
 # ----- live decoding --------------------------------------------------------

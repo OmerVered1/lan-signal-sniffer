@@ -249,3 +249,52 @@ def test_a_profile_with_no_signals_is_rejected():
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ----- where profiles live --------------------------------------------------
+
+
+def test_user_profiles_are_kept_outside_the_installation():
+    """An imported profile must survive an update.
+
+    Writing profiles next to the executable puts them under Program Files,
+    where the installer replaces the whole directory on every update — losing
+    exactly the thing that took an experiment to produce.
+    """
+    from lan_sniffer.protocol.profile import bundled_profile_dir, user_profile_dir
+
+    bundled, user = bundled_profile_dir(), user_profile_dir()
+    assert user != bundled
+    assert bundled not in user.parents
+
+
+def test_shipped_and_user_profiles_are_both_offered(tmp_path, monkeypatch):
+    from lan_sniffer.protocol import profile as profile_mod
+
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    good_profile().save(mine / "test.json")
+    monkeypatch.setattr(profile_mod, "user_profile_dir", lambda: mine)
+
+    names = [p.name for p in profile_mod.load_profiles()]
+    assert "Test" in names, "the user's own profile must appear"
+    assert "Setaram DSC (Setline)" in names, "shipped profiles must still appear"
+
+
+def test_a_user_profile_overrides_a_shipped_one_of_the_same_name(tmp_path, monkeypatch):
+    # A correction the user made must not be undone by an update reinstating
+    # the original.
+    from lan_sniffer.protocol import profile as profile_mod
+
+    mine = tmp_path / "mine"
+    mine.mkdir()
+    edited = DeviceProfile.load(
+        profile_mod.bundled_profile_dir() / "setaram_dsc_setline.json"
+    )
+    edited.signals = edited.signals[:1]
+    edited.signals[0].name = "my_corrected_signal"
+    edited.save(mine / "dsc.json")
+    monkeypatch.setattr(profile_mod, "user_profile_dir", lambda: mine)
+
+    loaded = {p.name: p for p in profile_mod.load_profiles()}
+    assert loaded["Setaram DSC (Setline)"].signal_names == ["my_corrected_signal"]

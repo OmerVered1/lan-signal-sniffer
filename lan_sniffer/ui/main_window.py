@@ -47,7 +47,13 @@ from ..protocol.framer import (
     group_chunks_by_flow,
     split_frames,
 )
-from ..protocol.profile import DeviceProfile, LiveDecoder, build_profile, load_profiles
+from ..protocol.profile import (
+    DeviceProfile,
+    LiveDecoder,
+    build_profile,
+    load_profiles,
+    user_profile_dir,
+)
 from ..protocol.session import Calibration, Observation, SessionDetector
 from ..writers.csv_writer import SessionCSVWriter
 from ..writers.raw_writer import RawWriter
@@ -61,7 +67,9 @@ REDRAW_INTERVAL_MS = 1000
 # few hundred poll cycles, which is well past what the scan needs.
 ANALYSIS_BUFFER = 20000
 
-PROFILE_DIR = Path(__file__).resolve().parents[2] / "profiles"
+# Profiles are read from both the installation and the user's own folder;
+# everything written goes to the latter so it survives an update.
+PROFILE_DIR = user_profile_dir()
 
 
 class MainWindow(QMainWindow):
@@ -327,7 +335,7 @@ class MainWindow(QMainWindow):
         self._profile_box.blockSignals(True)
         self._profile_box.clear()
         self._profile_box.addItem("(none — identify from traffic)", None)
-        for profile in load_profiles(PROFILE_DIR):
+        for profile in load_profiles():
             self._profile_box.addItem(profile.name, profile)
         self._profile_box.blockSignals(False)
         if select:
