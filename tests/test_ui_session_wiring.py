@@ -40,6 +40,28 @@ def qapp():
     yield app
 
 
+class FakePump:
+    """Stands in for a capture so the window's own loop can be driven.
+
+    Injecting chunks here rather than calling the decoder directly means the
+    tests cross every seam the real thing does — poll, event handling, session
+    open and close — which is where the faults that reached the bench lived.
+    """
+
+    def __init__(self) -> None:
+        self.queued = []
+
+    def poll(self, limit: int = 5000):
+        out, self.queued = self.queued, []
+        return out
+
+    def status(self) -> str:
+        return "fake"
+
+    def stop(self) -> None:
+        pass
+
+
 @pytest.fixture
 def window(qapp, tmp_path, monkeypatch):
     from lan_sniffer.ui import main_window as mw
@@ -49,10 +71,22 @@ def window(qapp, tmp_path, monkeypatch):
     index = w._profile_box.findText("Setaram DSC (Setline)")
     assert index >= 0, "the DSC profile must be loadable"
     w._profile_box.setCurrentIndex(index)
+    w._label_edit.setText("dsc")
+    w._on_label_changed()
     w._output_dir = tmp_path / "sessions"
     w._device.setEditText("169.254.93.1")
+    w._save_device_form()
+    arm(w)
     yield w
     w.close()
+
+
+def arm(window):
+    """Put the window in the state a running capture would."""
+    for monitor in window._monitors:
+        if monitor.pump is None:
+            monitor.pump = FakePump()
+    window._capturing = True
 
 
 def status_reply(temperature: float, heat_flow: float) -> bytes:
@@ -63,8 +97,10 @@ def status_reply(temperature: float, heat_flow: float) -> bytes:
     return bytes(body)
 
 
-def feed(window, exchanges) -> None:
-    """Push request/reply pairs through the window the way capture does."""
+def feed(window, exchanges, device: int = 0) -> None:
+    """Replay request/reply pairs into one device, then run the window's loop."""
+    arm(window)
+    monitor = window._monitors[device]
     asm = TCPReassembler(synth.DEVICE_IP)
     c_seq, s_seq = 1000, 5000
     for ts, request, reply in exchanges:
@@ -77,11 +113,8 @@ def feed(window, exchanges) -> None:
                 ts + 0.01, synth.DEVICE_IP, 1210, synth.PEER_IP, 51234, s_seq, reply
             )
             s_seq += len(reply)
-        window._handle_requests(chunks)
-        if window._decoder is not None:
-            for sample in window._decoder.feed(chunks):
-                if window._csv is not None:
-                    window._csv.add(sample.ts, sample.values)
+        monitor.pump.queued.extend(chunks)
+        window._poll()
 
 
 def a_run(start_at=20.0, stop_at=920.0, until=1000.0):
@@ -157,6 +190,153 @@ def test_two_sessions_in_the_same_second_do_not_overwrite_each_other(window, tmp
     feed(window, a_run(start_at=10.0, stop_at=11.0, until=12.0))
     written = sorted((tmp_path / "sessions").glob("*.csv"))
     assert len(written) == 2, f"one file was overwritten: {[p.name for p in written]}"
+
+
+# ----- two devices, one file ------------------------------------------------
+
+
+def add_second_device(window, label="dsc2"):
+    """Watch a second instrument alongside the first."""
+    window._add_device()
+    window._profile_box.setCurrentIndex(
+        window._profile_box.findText("Setaram DSC (Setline)")
+    )
+    window._label_edit.setText(label)
+    window._on_label_changed()
+    window._device.setEditText("169.254.93.2")
+    window._save_device_form()
+    arm(window)
+
+
+def test_one_device_keeps_its_columns_unprefixed(window, tmp_path):
+    # Files recorded before multi-device support must stay comparable.
+    feed(window, a_run(start_at=1.0, stop_at=5.0, until=8.0))
+    written = sorted((tmp_path / "sessions").glob("*.csv"))
+    header = written[0].read_text().splitlines()[0]
+    assert "sample_temperature (degC)" in header
+    assert "dsc." not in header
+
+
+def test_two_devices_get_their_names_on_their_columns(window, tmp_path):
+    add_second_device(window)
+    feed(window, a_run(start_at=1.0, stop_at=5.0, until=8.0), device=0)
+    written = sorted((tmp_path / "sessions").glob("*.csv"))
+    header = written[0].read_text().splitlines()[0]
+    # Both instruments report a signal called sample_temperature; without the
+    # prefix one would overwrite the other in the same row.
+    assert "dsc.sample_temperature (degC)" in header
+    assert "dsc2.sample_temperature (degC)" in header
+
+
+def feed_together(window, per_device) -> None:
+    """Replay several devices at once, in timestamp order.
+
+    Feeding one device's whole run before the other's starts would be two
+    sequential experiments, which correctly produce two files. Instruments
+    running side by side have to be interleaved to be tested at all.
+    """
+    arm(window)
+    streams = []
+    for device, exchanges in per_device:
+        asm = TCPReassembler(synth.DEVICE_IP)
+        streams.append([device, asm, list(exchanges), 1000, 5000])
+
+    while any(stream[2] for stream in streams):
+        streams.sort(key=lambda st: st[2][0][0] if st[2] else float("inf"))
+        stream = streams[0]
+        device, asm, exchanges, c_seq, s_seq = stream
+        ts, request, reply = exchanges.pop(0)
+        chunks = asm.add_segment(
+            ts, synth.PEER_IP, 51234 + device, synth.DEVICE_IP, 1210, c_seq, request
+        )
+        stream[3] = c_seq + len(request)
+        if reply:
+            chunks += asm.add_segment(
+                ts + 0.01, synth.DEVICE_IP, 1210,
+                synth.PEER_IP, 51234 + device, s_seq, reply,
+            )
+            stream[4] = s_seq + len(reply)
+        window._monitors[device].pump.queued.extend(chunks)
+        window._poll()
+
+
+def test_both_devices_write_into_the_same_file(window, tmp_path):
+    import csv as csvmod
+
+    add_second_device(window)
+    feed_together(
+        window,
+        [
+            (0, a_run(start_at=1.0, stop_at=200.0, until=210.0)),
+            (1, a_run(start_at=2.0, stop_at=200.0, until=210.0)),
+        ],
+    )
+    written = sorted((tmp_path / "sessions").glob("*.csv"))
+    assert len(written) == 1, "one session must cover both devices"
+
+    rows = list(csvmod.reader(written[0].open()))
+    header, body = rows[0], rows[1:]
+    for name in ("dsc.sample_temperature (degC)", "dsc2.sample_temperature (degC)"):
+        column = header.index(name)
+        assert any(r[column] for r in body), f"{name} was never written"
+
+
+def test_a_session_opens_as_soon_as_either_device_starts(window):
+    add_second_device(window)
+    feed(window, [(1.0, START_CMD, b"")], device=1)
+    assert window._csv is not None
+    assert window._monitors[1].running and not window._monitors[0].running
+
+
+def test_the_file_stays_open_while_any_device_is_still_running(window):
+    """Closing on the first stop would truncate the file mid-experiment."""
+    add_second_device(window)
+    feed(window, [(1.0, START_CMD, b"")], device=0)
+    feed(window, [(2.0, START_CMD, b"")], device=1)
+    assert window._csv is not None
+
+    feed(window, [(100.0, STOP_CMD, b"")], device=0)
+    assert window._csv is not None, "the second device is still running"
+
+    feed(window, [(200.0, STOP_CMD, b"")], device=1)
+    assert window._csv is None, "both have stopped; the file must close"
+
+
+def test_removing_a_device_drops_its_columns(window):
+    add_second_device(window)
+    assert any(m.prefix for m in window._monitors)
+    window._remove_device()
+    assert len(window._monitors) == 1
+    # Back to one device, so the prefix goes away again.
+    assert window._monitors[0].prefix == ""
+
+
+def test_relabelling_devices_does_not_pile_up_legend_entries(qapp):
+    """The plot is rebuilt whenever the device list or a label changes.
+
+    Emptying the curves without taking them off the plot left every previous
+    name in the legend, so with two devices a few relabels buried the chart
+    under its own key.
+    """
+    from lan_sniffer.ui.live_view import LiveView
+
+    view = LiveView()
+    names = [f"dsc.sig{i}" for i in range(7)] + [f"c80.sig{i}" for i in range(5)]
+    for _ in range(4):
+        view.set_signals(names, {})
+    assert len(view._curves) == len(names)
+    assert len(view._legend.items) == len(names)
+    assert view._legend_row.count() == len(names)
+
+
+def test_the_plot_drops_signals_that_are_gone(qapp):
+    from lan_sniffer.ui.live_view import LiveView
+
+    view = LiveView()
+    view.set_signals(["a", "b", "c"], {})
+    view.set_signals(["a"], {})
+    assert list(view._curves) == ["a"]
+    assert len(view._legend.items) == 1
 
 
 if __name__ == "__main__":  # pragma: no cover

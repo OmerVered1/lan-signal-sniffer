@@ -1,10 +1,15 @@
-"""The main window: pick a device, watch it, record what it says.
+"""The main window: pick the devices, watch them, record what they say.
 
 The whole application is one loop. A timer drains captured packets, hands the
 reassembled chunks to whatever wants them, and repeats. Everything else —
 identification, calibration, recording — is a consumer of that one stream, which
 is why a session can be recorded while the identification dialog is open and why
 calibration does not need its own capture.
+
+Several devices can be watched at once and share a single session file.
+Each has its own capture, decoder and run detector — all held in a
+DeviceMonitor — while the file, the plot and the recording state are the
+window's, because they are common to the whole setup.
 """
 
 from __future__ import annotations
@@ -34,27 +39,21 @@ from PyQt5.QtWidgets import (
 
 from .._version import __app_name__, __version__
 from ..capture.capture import (
-    PacketPump,
     capture_readiness,
     describe_interfaces,
     interface_for,
 )
 from ..capture.neighbors import arp_neighbors
-from ..capture.reassembly import C2S, StreamChunk
-from ..protocol.framer import (
-    TimedStream,
-    analyze_flow,
-    group_chunks_by_flow,
-    split_frames,
-)
+from ..capture.reassembly import StreamChunk
+from ..monitor import DeviceConfig, DeviceMonitor
+from ..protocol.framer import analyze_flow, group_chunks_by_flow
 from ..protocol.profile import (
     DeviceProfile,
-    LiveDecoder,
     build_profile,
     load_profiles,
     user_profile_dir,
 )
-from ..protocol.session import Calibration, Observation, SessionDetector
+from ..protocol.session import Calibration
 from ..writers.csv_writer import SessionCSVWriter
 from ..writers.raw_writer import RawWriter
 from .calibrate import CalibrateDialog
@@ -63,9 +62,6 @@ from .live_view import LiveView
 
 POLL_INTERVAL_MS = 250
 REDRAW_INTERVAL_MS = 1000
-# Chunks retained for identification while no profile is loaded. Enough for a
-# few hundred poll cycles, which is well past what the scan needs.
-ANALYSIS_BUFFER = 20000
 
 # Profiles are read from both the installation and the user's own folder;
 # everything written goes to the latter so it survives an update.
@@ -78,15 +74,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{__app_name__} {__version__}")
         self.resize(1180, 720)
 
-        self._pump: Optional[PacketPump] = None
-        self._profile: Optional[DeviceProfile] = None
-        self._decoder: Optional[LiveDecoder] = None
-        self._detector: Optional[SessionDetector] = None
+        # Several devices can be watched at once and share one session file,
+        # so everything per-device lives in a monitor rather than on the window.
+        self._monitors: List[DeviceMonitor] = [
+            DeviceMonitor(DeviceConfig(label="Device 1"))
+        ]
+        self._current = 0
+        self._capturing = False
         self._csv: Optional[SessionCSVWriter] = None
         self._raw: Optional[RawWriter] = None
-        self._analysis_buffer: List[StreamChunk] = []
-        self._request_sink: Optional[List[Tuple[float, bytes]]] = None
-        self._request_carry = bytearray()
         self._output_dir = Path.home() / "LAN Sniffer Sessions"
         self._session_started: Optional[float] = None
         self._survey_raw: Optional[RawWriter] = None
@@ -96,6 +92,8 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._check_readiness()
         self._refresh_profiles()
+        self._refresh_device_picker()
+        self._load_device_form()
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll)
@@ -125,7 +123,7 @@ class MainWindow(QMainWindow):
             __version__,
             parent=self,
             silent_if_uptodate=silent,
-            capture_active=self._pump is not None,
+            capture_active=self._capturing,
         )
 
     def _show_about(self) -> None:
@@ -183,8 +181,38 @@ class MainWindow(QMainWindow):
         self._capture_btn = QPushButton("Start capture")
         self._capture_btn.clicked.connect(self._toggle_capture)
 
-        device_group = QGroupBox("Device")
+        # One form shared by every device, with a selector above it. Duplicating
+        # the whole form per device would not fit the panel and would not scale
+        # past the two this was asked for.
+        self._device_picker = QComboBox()
+        self._device_picker.currentIndexChanged.connect(self._on_device_selected)
+        self._add_device_btn = QPushButton("+")
+        self._remove_device_btn = QPushButton("\u2212")
+        for button, tip in (
+            (self._add_device_btn, "Watch another device at the same time"),
+            (self._remove_device_btn, "Stop watching the selected device"),
+        ):
+            button.setFixedWidth(30)
+            button.setToolTip(tip)
+        self._add_device_btn.clicked.connect(self._add_device)
+        self._remove_device_btn.clicked.connect(self._remove_device)
+        picker_row = QHBoxLayout()
+        picker_row.addWidget(self._device_picker, 1)
+        picker_row.addWidget(self._add_device_btn)
+        picker_row.addWidget(self._remove_device_btn)
+
+        self._label_edit = QLineEdit()
+        self._label_edit.setPlaceholderText("a short name, e.g. dsc")
+        self._label_edit.setToolTip(
+            "Names this device's columns when more than one is being watched,\n"
+            "so two instruments reporting 'sample_temperature' stay apart."
+        )
+        self._label_edit.editingFinished.connect(self._on_label_changed)
+
+        device_group = QGroupBox("Devices")
         form = QFormLayout(device_group)
+        form.addRow("Watching", picker_row)
+        form.addRow("Name", self._label_edit)
         form.addRow("Interface", self._interface)
         form.addRow("Address", device_row)
         form.addRow("Port", self._port)
@@ -276,6 +304,112 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self._update_controls()
 
+    # ----- the device list -------------------------------------------------
+
+    @property
+    def _monitor(self) -> DeviceMonitor:
+        """The device the form is currently editing."""
+        return self._monitors[self._current]
+
+    def _assign_prefixes(self) -> None:
+        """Qualify signal names only when more than one device is watched.
+
+        A single-device recording keeps exactly the columns it always had, so
+        files from before this existed stay directly comparable.
+        """
+        multiple = len(self._monitors) > 1
+        for monitor in self._monitors:
+            monitor.prefix = f"{_slug(monitor.name)}." if multiple else ""
+
+    def _refresh_device_picker(self) -> None:
+        self._device_picker.blockSignals(True)
+        self._device_picker.clear()
+        for i, monitor in enumerate(self._monitors):
+            mark = " \u25cf" if monitor.running else ""
+            self._device_picker.addItem(f"{monitor.name}{mark}", i)
+        self._device_picker.setCurrentIndex(self._current)
+        self._device_picker.blockSignals(False)
+        self._remove_device_btn.setEnabled(len(self._monitors) > 1)
+
+    def _on_device_selected(self, index: int) -> None:
+        if index < 0 or index >= len(self._monitors):
+            return
+        self._save_device_form()
+        self._current = index
+        self._load_device_form()
+
+    def _add_device(self) -> None:
+        self._save_device_form()
+        self._monitors.append(
+            DeviceMonitor(DeviceConfig(label=f"Device {len(self._monitors) + 1}"))
+        )
+        self._current = len(self._monitors) - 1
+        self._assign_prefixes()
+        self._refresh_device_picker()
+        self._load_device_form()
+        self._refresh_live_signals()
+        if self._capturing:
+            self.statusBar().showMessage(
+                "Added a device. Restart the capture to include it.", 8000
+            )
+        self._update_controls()
+
+    def _remove_device(self) -> None:
+        if len(self._monitors) < 2:
+            return
+        monitor = self._monitors.pop(self._current)
+        monitor.stop_capture()
+        self._current = min(self._current, len(self._monitors) - 1)
+        self._assign_prefixes()
+        self._refresh_device_picker()
+        self._load_device_form()
+        self._refresh_live_signals()
+        self._update_controls()
+
+    def _load_device_form(self) -> None:
+        """Show the selected device's settings in the shared form."""
+        config = self._monitor.config
+        for widget in (self._label_edit, self._device, self._port, self._profile_box):
+            widget.blockSignals(True)
+        self._label_edit.setText(config.label)
+        self._device.setEditText(config.ip)
+        self._port.setValue(config.port or 0)
+        index = (
+            self._profile_box.findText(config.profile.name)
+            if config.profile
+            else 0
+        )
+        self._profile_box.setCurrentIndex(max(0, index))
+        for widget in (self._label_edit, self._device, self._port, self._profile_box):
+            widget.blockSignals(False)
+
+        iface = self._interface.findData(config.interface)
+        self._interface.setCurrentIndex(iface if iface >= 0 else 0)
+        self._on_device_changed()
+
+    def _save_device_form(self) -> None:
+        """Write the form back to the selected device."""
+        config = self._monitor.config
+        config.label = self._label_edit.text().strip() or config.label
+        config.ip = self._selected_ip()
+        config.port = self._port.value() or None
+        config.interface = self._interface.currentData()
+
+    def _on_label_changed(self) -> None:
+        self._save_device_form()
+        self._assign_prefixes()
+        self._refresh_device_picker()
+        self._refresh_live_signals()
+
+    def _refresh_live_signals(self) -> None:
+        """Rebuild the plot for every signal on every configured device."""
+        names: List[str] = []
+        units: Dict[str, str] = {}
+        for monitor in self._monitors:
+            names.extend(monitor.signal_names())
+            units.update(monitor.units())
+        self._live.set_signals(names, units)
+
     # ----- readiness and devices -----------------------------------------
 
     def _check_readiness(self) -> None:
@@ -357,62 +491,70 @@ class MainWindow(QMainWindow):
         self._on_profile_changed()
 
     def _on_profile_changed(self) -> None:
-        self._profile = self._profile_box.currentData()
-        self._decoder = LiveDecoder(self._profile) if self._profile else None
-        self._detector = None
-        if self._profile:
-            calibration = Calibration.from_dict(self._profile.session or {})
-            self._detector = SessionDetector(calibration)
-            units = {s.name: s.unit for s in self._profile.signals}
-            self._live.set_signals(self._profile.signal_names, units)
-            if self._profile.device_port:
-                self._port.setValue(self._profile.device_port)
-            if self._profile.ip_hint and not self._device.currentText():
-                self._device.setEditText(self._profile.ip_hint)
-        else:
-            self._live.set_signals([], {})
+        profile = self._profile_box.currentData()
+        self._monitor.apply_profile(profile)
+        if profile:
+            if profile.device_port:
+                self._port.setValue(profile.device_port)
+            if profile.ip_hint and not self._device.currentText():
+                self._device.setEditText(profile.ip_hint)
+            if self._monitor.config.label.startswith("Device "):
+                # A freshly added device is better named after what it is.
+                self._label_edit.setText(profile.name)
+        self._save_device_form()
+        self._assign_prefixes()
+        self._refresh_device_picker()
+        self._refresh_live_signals()
         self._update_controls()
 
     # ----- capture --------------------------------------------------------
 
     def _toggle_capture(self) -> None:
-        if self._pump is not None:
+        if self._capturing:
             self._stop_capture()
             return
 
         if not self._capture_ready:
-            QMessageBox.warning(
-                self, "Capture unavailable", self._readiness.text()
-            )
-            return
-        ip = self._selected_ip()
-        if not ip:
-            QMessageBox.warning(
-                self, "No device", "Pick a device address, or type one in."
-            )
+            QMessageBox.warning(self, "Capture unavailable", self._readiness.text())
             return
 
-        port = self._port.value() or None
-        self._pump = PacketPump(ip, port, self._resolved_interface())
-        try:
-            self._pump.start()
-        except Exception as e:
-            self._pump = None
-            QMessageBox.critical(
+        self._save_device_form()
+        unset = [m.name for m in self._monitors if not m.config.ip]
+        if unset:
+            QMessageBox.warning(
                 self,
-                "Could not start capture",
-                f"{e}\n\nOn Windows this usually means Npcap is missing or the "
-                "app is not running as Administrator. On macOS and Linux it "
-                "usually means it was not run with sudo.",
+                "No address",
+                "These devices have no address yet: " + ", ".join(unset) + ".",
             )
             return
 
-        self._analysis_buffer.clear()
-        self._request_carry.clear()
+        started: List[DeviceMonitor] = []
+        for monitor in self._monitors:
+            interface = monitor.config.interface or interface_for(monitor.config.ip)
+            try:
+                monitor.start_capture(interface)
+            except Exception as e:
+                # Leaving the others running would be worse than not starting:
+                # a session would silently cover only part of the setup.
+                for already in started:
+                    already.stop_capture()
+                QMessageBox.critical(
+                    self,
+                    "Could not start capture",
+                    f"{monitor.name}: {e}\n\nOn Windows this usually means Npcap "
+                    "is missing or the app is not running as Administrator. On "
+                    "macOS and Linux it usually means it was not run with sudo.",
+                )
+                return
+            started.append(monitor)
+
+        self._capturing = True
         self._poll_timer.start(POLL_INTERVAL_MS)
         self._redraw_timer.start(REDRAW_INTERVAL_MS)
         self._capture_btn.setText("Stop capture")
-        self.statusBar().showMessage(f"Capturing: {self._pump.bpf_filter}")
+        self.statusBar().showMessage(
+            "Capturing " + ", ".join(m.name for m in self._monitors)
+        )
         self._update_controls()
 
     def _stop_capture(self) -> None:
@@ -423,95 +565,71 @@ class MainWindow(QMainWindow):
         # Not manual=True: shutting the capture down is teardown, not the
         # user ending a session, and must not change the detector's arming.
         self._close_session()
-        if self._pump is not None:
-            self._pump.stop()
-            self._pump = None
+        for monitor in self._monitors:
+            monitor.stop_capture()
+        self._capturing = False
         self._capture_btn.setText("Start capture")
         self._update_controls()
 
     def _poll(self) -> None:
-        if self._pump is None:
+        if not self._capturing:
             return
-        chunks = self._pump.poll()
-        if chunks:
-            self._analysis_buffer.extend(chunks)
-            del self._analysis_buffer[:-ANALYSIS_BUFFER]
-            self._handle_requests(chunks)
-            if self._raw is not None:
-                self._raw.add(chunks)
-            if self._survey_raw is not None:
-                self._survey_raw.add(chunks)
-            if self._decoder is not None:
-                for sample in self._decoder.feed(chunks):
-                    self._live.add(sample.ts, sample.values)
-                    if self._csv is not None:
-                        self._csv.add(sample.ts, sample.values)
 
-        if self._detector is not None:
-            event = self._detector.tick(time.time())
-            if event == "stop":
-                self._close_session()
+        buffered = 0
+        for monitor in self._monitors:
+            result = monitor.poll()
+            buffered += len(monitor.analysis_buffer)
 
-        status = f"{self._pump.status()} · {len(self._analysis_buffer)} chunks buffered"
+            if result.chunks:
+                if self._raw is not None:
+                    self._raw.add(result.chunks)
+                if self._survey_raw is not None and monitor is self._monitor:
+                    self._survey_raw.add(result.chunks)
+
+            for event, ts in result.events:
+                self._on_device_event(monitor, event, ts)
+
+            for sample in result.samples:
+                self._live.add(sample.ts, sample.values)
+                if self._csv is not None:
+                    self._csv.add(sample.ts, sample.values)
+
+            if monitor.tick(time.time()) == "stop":
+                self._on_device_event(monitor, "stop", time.time())
+
+        status = " · ".join(
+            [f"{m.name}: {m.status()}" for m in self._monitors]
+            + [f"{buffered} chunks buffered"]
+        )
         if self._survey_raw is not None:
             status += f" · survey: {self._survey_raw.chunks_written} chunks recorded"
         self.statusBar().showMessage(status)
         self._update_session_label()
 
-    def _handle_requests(self, chunks: List[StreamChunk]) -> None:
-        """Extract request frames, for calibration and session detection."""
-        if self._request_sink is None and self._detector is None:
-            return
-        for frame_ts, frame in self._iter_requests(chunks):
-            if self._request_sink is not None:
-                self._request_sink.append((frame_ts, frame))
-            if self._detector is not None:
-                signature = self._detector.calibration.signature_of(frame)
-                # Both outcomes have to be acted on. Acting only on "start" left
-                # the stop command decoded, reported, and ignored — and since
-                # tick() deliberately withholds the quiet timeout whenever a
-                # stop command exists, nothing else could ever end the session.
-                event = self._detector.observe(Observation(frame_ts, signature))
-                if event == "start":
-                    self._open_session()
-                elif event == "stop":
-                    self._close_session()
+    def _on_device_event(self, monitor: DeviceMonitor, event: str, ts: float) -> None:
+        """Open or close the shared session as devices start and stop.
 
-    def _iter_requests(self, chunks: List[StreamChunk]):
-        """Split client segments into request frames, carrying partials over."""
-        for chunk in chunks:
-            if chunk.direction != C2S:
-                continue
-            if chunk.gap_before:
-                self._request_carry.clear()
-            self._request_carry.extend(chunk.data)
-            if self._profile is None:
-                # Without a profile the segment is the best frame guess there is,
-                # which is the same fallback the framer uses.
-                yield chunk.ts, bytes(self._request_carry)
-                self._request_carry.clear()
-                continue
-            stream = TimedStream()
-            stream.append(
-                StreamChunk(
-                    ts=chunk.ts,
-                    flow=chunk.flow,
-                    direction=C2S,
-                    data=bytes(self._request_carry),
-                    stream_offset=0,
-                )
-            )
-            frames = split_frames(stream, self._profile.request_framing)
-            consumed = 0
-            for frame in frames:
-                consumed += len(frame.data)
-                yield chunk.ts, frame.data
-            del self._request_carry[:consumed]
+        One file covers every device, so it opens as soon as any device reports
+        a run beginning and closes only once every device that was running has
+        stopped. Closing on the first stop would truncate the file while another
+        instrument was still going.
+        """
+        was_running = monitor.running
+        monitor.running = event == "start"
+        if monitor.running == was_running:
+            return
+        self._refresh_device_picker()
+
+        if event == "start":
+            if self._csv is None:
+                self._open_session()
+        elif not any(m.running for m in self._monitors):
+            self._close_session()
 
     # ----- identification and calibration ---------------------------------
 
     def _identify(self) -> None:
-        if not self._analysis_buffer:
+        if not self._monitor.analysis_buffer:
             QMessageBox.information(
                 self,
                 "Nothing captured yet",
@@ -522,7 +640,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        flows = group_chunks_by_flow(self._analysis_buffer)
+        flows = group_chunks_by_flow(self._monitor.analysis_buffer)
         largest = max(flows.values(), key=len)
         analysis = analyze_flow(largest)
         if not analysis.channels:
@@ -537,7 +655,7 @@ class MainWindow(QMainWindow):
         def refresh():
             # Re-analyse the buffer as it grows, so the dialog's values track
             # the instrument while the user is looking at them.
-            flows = group_chunks_by_flow(self._analysis_buffer)
+            flows = group_chunks_by_flow(self._monitor.analysis_buffer)
             if not flows:
                 return None
             return analyze_flow(max(flows.values(), key=len))
@@ -578,7 +696,7 @@ class MainWindow(QMainWindow):
         )
 
     def _calibrate(self) -> None:
-        if self._pump is None:
+        if not self._capturing:
             QMessageBox.information(
                 self,
                 "Start the capture first",
@@ -588,7 +706,7 @@ class MainWindow(QMainWindow):
             return
 
         sink: List[Tuple[float, bytes]] = []
-        self._request_sink = sink
+        self._monitor.request_sink = sink
 
         def collect() -> List[Tuple[float, bytes]]:
             taken, sink[:] = list(sink), []
@@ -596,11 +714,11 @@ class MainWindow(QMainWindow):
 
         dialog = CalibrateDialog(collect, parent=self)
         accepted = dialog.exec_() == CalibrateDialog.Accepted
-        self._request_sink = None
+        self._monitor.request_sink = None
         if not accepted or dialog.result is None:
             return
 
-        if self._profile is None:
+        if self._monitor.profile is None:
             QMessageBox.information(
                 self,
                 "No profile to save it to",
@@ -609,9 +727,10 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self._profile.session = dialog.result.to_dict()
-        self._profile.save(PROFILE_DIR / f"{_slug(self._profile.name)}.json")
-        self._detector = SessionDetector(dialog.result)
+        profile = self._monitor.profile
+        profile.session = dialog.result.to_dict()
+        profile.save(PROFILE_DIR / f"{_slug(profile.name)}.json")
+        self._monitor.apply_profile(profile)
         QMessageBox.information(
             self, "Calibration saved", dialog.result.explanation
         )
@@ -633,7 +752,7 @@ class MainWindow(QMainWindow):
         experiment that runs for hours costs nothing to hold and survives the
         app being killed — the file can be converted afterwards either way.
         """
-        if self._pump is None:
+        if not self._capturing:
             QMessageBox.information(
                 self,
                 "Start the capture first",
@@ -792,7 +911,8 @@ class MainWindow(QMainWindow):
     def _open_session(self, manual: bool = False) -> None:
         if self._csv is not None:
             return
-        if self._profile is None:
+        configured = [m for m in self._monitors if m.profile is not None]
+        if not configured:
             QMessageBox.warning(
                 self,
                 "No profile",
@@ -802,17 +922,26 @@ class MainWindow(QMainWindow):
             return
 
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        base = _unclaimed(self._output_dir / f"{_slug(self._profile.name)}_{stamp}")
-        units = {s.name: s.unit for s in self._profile.signals}
+        stem = (
+            _slug(configured[0].profile.name)
+            if len(configured) == 1
+            else "_".join(_slug(m.name) for m in configured)
+        )
+        base = _unclaimed(self._output_dir / f"{stem}_{stamp}")
+        names: List[str] = []
+        units: Dict[str, str] = {}
+        for monitor in configured:
+            names.extend(monitor.signal_names())
+            units.update(monitor.units())
         try:
             self._csv = SessionCSVWriter(
-                base.with_suffix(".csv"), self._profile.signal_names, units
+                base.with_suffix(".csv"), names, units
             )
             self._raw = RawWriter(
                 Path(str(base) + ".raw.jsonl"),
                 device_ip=self._selected_ip(),
                 device_port=self._port.value() or None,
-                note=f"profile: {self._profile.name}",
+                note="profiles: " + ", ".join(m.profile.name for m in configured),
             )
         except OSError as e:
             # Raised from a timer callback this would vanish into the console
@@ -827,14 +956,17 @@ class MainWindow(QMainWindow):
             return
         self._session_started = time.time()
         self._live.mark_session(self._session_started, "start")
-        if manual and self._detector is not None:
-            self._detector.start(time.time())
+        if manual:
+            for monitor in self._monitors:
+                if monitor.detector is not None:
+                    monitor.detector.start(time.time())
+                    monitor.running = True
         self.statusBar().showMessage(f"Recording to {base.name}.csv", 8000)
         self._update_controls()
 
     def _close_session(self, manual: bool = False) -> None:
-        if self._decoder is not None:
-            tail = self._decoder.flush()
+        for monitor in self._monitors:
+            tail = monitor.flush()
             if tail is not None and self._csv is not None:
                 self._csv.add(tail.ts, tail.values)
         if self._csv is not None:
@@ -847,8 +979,13 @@ class MainWindow(QMainWindow):
             self._raw.close()
             self._raw = None
         self._session_started = None
-        if manual and self._detector is not None:
-            self._detector.stop()
+        if manual:
+            for monitor in self._monitors:
+                if monitor.detector is not None:
+                    monitor.detector.stop()
+        for monitor in self._monitors:
+            monitor.running = False
+        self._refresh_device_picker()
         self._update_controls()
 
     def _split_session(self) -> None:
@@ -877,9 +1014,15 @@ class MainWindow(QMainWindow):
         """
         if self._csv is not None and self._session_started is not None:
             elapsed = int(time.time() - self._session_started)
+            live = sum(1 for m in self._monitors if m.running)
+            across = (
+                f"   ·   {live}/{len(self._monitors)} devices"
+                if len(self._monitors) > 1
+                else ""
+            )
             self._banner.setText(
                 f"⏺  RECORDING   {elapsed // 60:d}:{elapsed % 60:02d}   ·   "
-                f"{self._csv.rows_written} rows"
+                f"{self._csv.rows_written} rows{across}"
             )
             self._banner.setStyleSheet(
                 "background:#1a7f37; color:white; font-weight:bold; "
@@ -890,8 +1033,16 @@ class MainWindow(QMainWindow):
             )
             return
 
-        detector = self._detector
-        automatic = detector is not None and detector.calibration.automatic
+        # With several devices the panel reports the one still waiting, since
+        # that is the one that would leave a run unrecorded.
+        armed = [
+            m for m in self._monitors
+            if m.detector is not None and m.detector.calibration.automatic
+        ]
+        waiting = [m for m in armed if m.detector.last_trigger_ts is None]
+        monitor = (waiting or armed or [None])[0]
+        detector = monitor.detector if monitor is not None else None
+        automatic = bool(armed)
         self._banner.setText("○  NOT RECORDING" + ("   ·   armed" if automatic else ""))
         self._banner.setStyleSheet(
             "background:#e8e8e8; color:#555; font-weight:bold; font-size:15px; "
@@ -916,7 +1067,8 @@ class MainWindow(QMainWindow):
         else:
             state = "<b>start command not seen yet</b>"
 
-        lines = [f"{detector.observed} requests · {state}"]
+        who = f"{monitor.name}: " if len(self._monitors) > 1 else ""
+        lines = [f"{who}{detector.observed} requests · {state}"]
         if detector.observed > 200 and detector.last_trigger_ts is None:
             lines.append(
                 "<span style='color:#a04000'>Run already going? Its start "
@@ -935,17 +1087,27 @@ class MainWindow(QMainWindow):
         self._session_label.setToolTip("\n".join(detail))
 
     def _update_controls(self) -> None:
-        capturing = self._pump is not None
+        capturing = self._capturing
         recording = self._csv is not None
         self._survey_btn.setEnabled(capturing)
         self._identify_btn.setEnabled(capturing)
         self._calibrate_btn.setEnabled(capturing)
-        self._start_btn.setEnabled(capturing and not recording and self._profile is not None)
+        has_profile = any(m.profile is not None for m in self._monitors)
+        self._start_btn.setEnabled(capturing and not recording and has_profile)
         self._stop_btn.setEnabled(recording)
         self._split_btn.setEnabled(recording)
-        self._interface.setEnabled(not capturing)
-        self._device.setEnabled(not capturing)
-        self._port.setEnabled(not capturing)
+        for widget in (
+            self._interface,
+            self._device,
+            self._port,
+            self._label_edit,
+            self._add_device_btn,
+            self._remove_device_btn,
+        ):
+            widget.setEnabled(not capturing)
+        self._remove_device_btn.setEnabled(
+            not capturing and len(self._monitors) > 1
+        )
         self._update_session_label()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming

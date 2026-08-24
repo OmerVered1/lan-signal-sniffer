@@ -31,6 +31,7 @@ a = Analysis(
     hiddenimports=[
         "lan_sniffer",
         "lan_sniffer._version",
+        "lan_sniffer.monitor",
         "lan_sniffer.updater",
         "lan_sniffer.capture.capture",
         "lan_sniffer.capture.neighbors",
@@ -109,7 +110,7 @@ if sys.platform == "darwin":
         icon=icon_path,
         bundle_identifier="il.ac.bgu.omervered.lansignalsniffer",
         info_plist={
-            "CFBundleShortVersionString": "0.5.2",
+            "CFBundleShortVersionString": "0.6.0",
             "NSHighResolutionCapable": True,
         },
     )

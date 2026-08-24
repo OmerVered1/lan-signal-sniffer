@@ -12,7 +12,7 @@ from typing import Deque, Dict, List, Sequence
 
 import pyqtgraph as pg
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QCheckBox, QHBoxLayout, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QCheckBox, QGridLayout, QVBoxLayout, QWidget
 
 # Points kept per signal. At one sample a second this is a bit over two hours,
 # which is longer than anyone watches a plot; the CSV holds the full record.
@@ -51,10 +51,11 @@ class LiveView(QWidget):
         self._plot.setBackground("w")
         self._plot.showGrid(x=True, y=True, alpha=0.25)
         self._plot.setLabel("bottom", "Elapsed time", units="s")
-        self._plot.addLegend(offset=(-10, 10))
+        self._legend = self._plot.addLegend(offset=(-10, 10))
 
-        self._legend_row = QHBoxLayout()
-        self._legend_row.addStretch(1)
+        # A grid rather than a row: two instruments can contribute a dozen or
+        # more signals, and a single row of checkboxes runs off the window.
+        self._legend_row = QGridLayout()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -64,14 +65,34 @@ class LiveView(QWidget):
     # ----- setup ---------------------------------------------------------
 
     def set_signals(self, names: Sequence[str], units: Dict[str, str]) -> None:
-        """Reset the plot for a new profile or session."""
+        """Reset the plot for a new profile, device list, or session.
+
+        The old curves have to be taken off the plot, not merely emptied.
+        Leaving them behind kept every previous name in the legend, so each
+        relabel or added device stacked another set of entries on top of the
+        last — with two devices the legend filled the chart.
+        """
         self.clear()
-        while self._legend_row.count() > 1:
+        for curve in self._curves.values():
+            self._plot.removeItem(curve)
+        self._curves.clear()
+        self._times.clear()
+        self._values.clear()
+        if self._legend is not None:
+            self._legend.clear()
+
+        while self._legend_row.count():
             item = self._legend_row.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                # Unparent before scheduling deletion: deleteLater only takes
+                # effect once the event loop runs, and until then the old
+                # checkboxes keep painting over the chart.
+                widget.setParent(None)
                 widget.deleteLater()
+        self._boxes.clear()
 
+        columns = 5
         for i, name in enumerate(names):
             colour = CURVE_COLOURS[i % len(CURVE_COLOURS)]
             unit = units.get(name, "")
@@ -86,7 +107,7 @@ class LiveView(QWidget):
             box.setStyleSheet(f"color: {colour};")
             box.stateChanged.connect(self._apply_visibility)
             self._boxes[name] = box
-            self._legend_row.insertWidget(self._legend_row.count() - 1, box)
+            self._legend_row.addWidget(box, i // columns, i % columns)
 
     def clear(self) -> None:
         self._t0 = None

@@ -109,6 +109,27 @@ fires at random; recording still works from the buttons.
 **5. Leave it running.** Sessions open and close on their own, and *Start*,
 *Stop* and *Split here* are always available.
 
+## Watching two instruments at once
+
+Press **+** next to *Watching* to add a device. Each gets its own name, address,
+adapter and profile, and each is captured separately — so two instruments on
+different network adapters are fine.
+
+Everything else is shared. Both devices plot on the same chart and record into
+**one file**, which is the point: readings from two instruments in the same run
+line up row by row without anything to reconcile afterwards.
+
+Columns are prefixed with the device name — `dsc.sample_temperature`,
+`c80.sample_temperature` — but **only when more than one device is configured**,
+so a single-device recording keeps exactly the columns it always had and stays
+comparable with older files.
+
+The session covers the whole setup: it opens as soon as **any** device reports a
+run starting, and closes only once **every** device that was running has
+stopped. Closing on the first stop would truncate the file while another
+instrument was still going. The banner shows how many devices are live
+(`2/2 devices`), and the device list marks each running one with a dot.
+
 ## When you can't identify it yourself
 
 Some instruments will not give up their layout to a scan and a sparkline. For
