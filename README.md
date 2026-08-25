@@ -111,7 +111,7 @@ fires at random; recording still works from the buttons.
 
 ## Watching two instruments at once
 
-Press **+** next to *Watching* to add a device. Each gets its own name, address,
+Press **Add** next to *Watching* to add a device. Each gets its own name, address,
 adapter and profile, and each is captured separately — so two instruments on
 different network adapters are fine.
 
