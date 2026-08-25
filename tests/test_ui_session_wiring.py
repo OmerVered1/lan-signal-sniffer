@@ -339,5 +339,79 @@ def test_the_plot_drops_signals_that_are_gone(qapp):
     assert len(view._legend.items) == 1
 
 
+# ----- a coupled rig: one instrument owns the experiment ---------------------
+
+
+def test_a_passenger_device_never_opens_a_session(window):
+    """A TPD rig's run belongs to the oven, not the gas analyser.
+
+    A mass spectrometer polls continuously and has no notion of a run at all,
+    so whatever its traffic looks like it must never start or stop the file.
+    """
+    add_second_device(window, label="ms")
+    window._monitors[1].config.controls_recording = False
+
+    feed(window, [(1.0, START_CMD, b"")], device=1)
+    assert window._csv is None, "the analyser must not open a recording"
+    assert window._monitors[1].running, "it is still marked as running"
+
+
+def test_the_controlling_device_opens_and_closes_it(window, tmp_path):
+    add_second_device(window, label="ms")
+    window._monitors[1].config.controls_recording = False
+
+    feed(window, [(1.0, START_CMD, b"")], device=0)
+    assert window._csv is not None, "the oven starts the recording"
+
+    feed(window, [(500.0, STOP_CMD, b"")], device=0)
+    assert window._csv is None, "and ends it, whatever the analyser is doing"
+
+
+def test_a_passenger_cannot_hold_the_file_open(window):
+    """The oven's run has ended; a still-running analyser must not extend it."""
+    add_second_device(window, label="ms")
+    window._monitors[1].config.controls_recording = False
+
+    feed(window, [(1.0, START_CMD, b"")], device=0)
+    feed(window, [(2.0, START_CMD, b"")], device=1)
+    feed(window, [(500.0, STOP_CMD, b"")], device=0)
+    assert window._csv is None
+
+
+def test_a_passenger_still_contributes_its_columns(window, tmp_path):
+    import csv as csvmod
+
+    add_second_device(window, label="ms")
+    window._monitors[1].config.controls_recording = False
+    feed_together(
+        window,
+        [
+            (0, a_run(start_at=1.0, stop_at=200.0, until=210.0)),
+            # No start or stop commands from the analyser at all: just data.
+            (1, [(float(t) + 0.5, STATUS_REQ, status_reply(20.0 + t * 0.1, 0.5))
+                 for t in range(210)]),
+        ],
+    )
+    written = sorted((tmp_path / "sessions").glob("*.csv"))
+    assert len(written) == 1
+    rows = list(csvmod.reader(written[0].open()))
+    header, body = rows[0], rows[1:]
+    column = header.index("ms.sample_temperature (degC)")
+    assert any(r[column] for r in body), "the analyser's data must be in the file"
+
+
+def test_both_controlling_devices_must_stop_before_the_file_closes(window):
+    # Two ovens, both running experiments: the file spans both.
+    add_second_device(window, label="oven2")
+    assert all(m.config.controls_recording for m in window._monitors)
+
+    feed(window, [(1.0, START_CMD, b"")], device=0)
+    feed(window, [(2.0, START_CMD, b"")], device=1)
+    feed(window, [(500.0, STOP_CMD, b"")], device=0)
+    assert window._csv is not None, "the second oven is still running"
+    feed(window, [(600.0, STOP_CMD, b"")], device=1)
+    assert window._csv is None
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

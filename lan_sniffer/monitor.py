@@ -37,6 +37,13 @@ class DeviceConfig:
     port: Optional[int] = 1210
     interface: Optional[str] = None
     profile: Optional[DeviceProfile] = None
+    # Whether this device's experiment drives the recording. In a coupled
+    # setup one instrument runs the experiment and the others are along for
+    # the ride: a TPD rig is an oven under Calisto with a mass spectrometer
+    # watching the evolved gas, and the run is the oven's. The gas analyser
+    # polls continuously and has no notion of a run at all, so letting it open
+    # or close the file would be wrong.
+    controls_recording: bool = True
 
 
 @dataclass

@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -186,13 +187,12 @@ class MainWindow(QMainWindow):
         # past the two this was asked for.
         self._device_picker = QComboBox()
         self._device_picker.currentIndexChanged.connect(self._on_device_selected)
-        self._add_device_btn = QPushButton("+")
-        self._remove_device_btn = QPushButton("\u2212")
+        self._add_device_btn = QPushButton("Add")
+        self._remove_device_btn = QPushButton("Remove")
         for button, tip in (
-            (self._add_device_btn, "Watch another device at the same time"),
-            (self._remove_device_btn, "Stop watching the selected device"),
+            (self._add_device_btn, "Watch another instrument at the same time"),
+            (self._remove_device_btn, "Stop watching the selected instrument"),
         ):
-            button.setFixedWidth(30)
             button.setToolTip(tip)
         self._add_device_btn.clicked.connect(self._add_device)
         self._remove_device_btn.clicked.connect(self._remove_device)
@@ -200,6 +200,20 @@ class MainWindow(QMainWindow):
         picker_row.addWidget(self._device_picker, 1)
         picker_row.addWidget(self._add_device_btn)
         picker_row.addWidget(self._remove_device_btn)
+
+        self._controls_box = QCheckBox("Its experiment drives recording")
+        # Checked by default, and it must be set before anything saves the form:
+        # the profile dropdown fires during startup, and an unchecked box would
+        # be written back to every device before its own settings were loaded.
+        self._controls_box.setChecked(True)
+        self._controls_box.setToolTip(
+            "Tick this for the instrument that runs the experiment.\n\n"
+            "In a coupled setup only one instrument has a run: a TPD rig is an\n"
+            "oven under Calisto with a mass spectrometer watching the gas. The\n"
+            "oven decides when recording starts and stops; the analyser just\n"
+            "contributes its columns for that window."
+        )
+        self._controls_box.stateChanged.connect(self._on_controls_changed)
 
         self._label_edit = QLineEdit()
         self._label_edit.setPlaceholderText("a short name, e.g. dsc")
@@ -217,6 +231,7 @@ class MainWindow(QMainWindow):
         form.addRow("Address", device_row)
         form.addRow("Port", self._port)
         form.addRow("Profile", self._profile_box)
+        form.addRow(self._controls_box)
         form.addRow(self._capture_btn)
 
         self._identify_btn = QPushButton("Identify signals…")
@@ -369,9 +384,16 @@ class MainWindow(QMainWindow):
     def _load_device_form(self) -> None:
         """Show the selected device's settings in the shared form."""
         config = self._monitor.config
-        for widget in (self._label_edit, self._device, self._port, self._profile_box):
+        for widget in (
+            self._label_edit,
+            self._device,
+            self._port,
+            self._profile_box,
+            self._controls_box,
+        ):
             widget.blockSignals(True)
         self._label_edit.setText(config.label)
+        self._controls_box.setChecked(config.controls_recording)
         self._device.setEditText(config.ip)
         self._port.setValue(config.port or 0)
         index = (
@@ -380,7 +402,13 @@ class MainWindow(QMainWindow):
             else 0
         )
         self._profile_box.setCurrentIndex(max(0, index))
-        for widget in (self._label_edit, self._device, self._port, self._profile_box):
+        for widget in (
+            self._label_edit,
+            self._device,
+            self._port,
+            self._profile_box,
+            self._controls_box,
+        ):
             widget.blockSignals(False)
 
         iface = self._interface.findData(config.interface)
@@ -394,6 +422,11 @@ class MainWindow(QMainWindow):
         config.ip = self._selected_ip()
         config.port = self._port.value() or None
         config.interface = self._interface.currentData()
+        config.controls_recording = self._controls_box.isChecked()
+
+    def _on_controls_changed(self) -> None:
+        self._save_device_form()
+        self._update_session_label()
 
     def _on_label_changed(self) -> None:
         self._save_device_form()
@@ -609,10 +642,15 @@ class MainWindow(QMainWindow):
     def _on_device_event(self, monitor: DeviceMonitor, event: str, ts: float) -> None:
         """Open or close the shared session as devices start and stop.
 
-        One file covers every device, so it opens as soon as any device reports
-        a run beginning and closes only once every device that was running has
-        stopped. Closing on the first stop would truncate the file while another
-        instrument was still going.
+        Only devices marked as controlling the recording move the file. In a
+        coupled setup the experiment belongs to one instrument — a TPD rig's
+        run is the oven's, not the mass spectrometer's — and the analyser polls
+        continuously with no notion of a run, so it must contribute columns
+        without ever opening or closing anything.
+
+        Where several do control it, the file opens on the first to start and
+        closes only once all of them have stopped, since closing on the first
+        stop would truncate it while another was still going.
         """
         was_running = monitor.running
         monitor.running = event == "start"
@@ -620,10 +658,15 @@ class MainWindow(QMainWindow):
             return
         self._refresh_device_picker()
 
+        if not monitor.config.controls_recording:
+            return
+
         if event == "start":
             if self._csv is None:
                 self._open_session()
-        elif not any(m.running for m in self._monitors):
+        elif not any(
+            m.running and m.config.controls_recording for m in self._monitors
+        ):
             self._close_session()
 
     # ----- identification and calibration ---------------------------------
@@ -939,9 +982,15 @@ class MainWindow(QMainWindow):
             )
             self._raw = RawWriter(
                 Path(str(base) + ".raw.jsonl"),
-                device_ip=self._selected_ip(),
+                # Every device's traffic lands in this one file, including any
+                # without a profile — so an instrument that could not be
+                # decoded yet is still recorded and can be decoded later.
+                device_ip=", ".join(m.config.ip for m in self._monitors if m.config.ip),
                 device_port=self._port.value() or None,
-                note="profiles: " + ", ".join(m.profile.name for m in configured),
+                note="; ".join(
+                    f"{m.name}: {m.profile.name if m.profile else 'no profile'}"
+                    for m in self._monitors
+                ),
             )
         except OSError as e:
             # Raised from a timer callback this would vanish into the console
@@ -1037,7 +1086,9 @@ class MainWindow(QMainWindow):
         # that is the one that would leave a run unrecorded.
         armed = [
             m for m in self._monitors
-            if m.detector is not None and m.detector.calibration.automatic
+            if m.detector is not None
+            and m.detector.calibration.automatic
+            and m.config.controls_recording
         ]
         waiting = [m for m in armed if m.detector.last_trigger_ts is None]
         monitor = (waiting or armed or [None])[0]

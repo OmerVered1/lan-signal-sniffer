@@ -124,11 +124,26 @@ Columns are prefixed with the device name — `dsc.sample_temperature`,
 so a single-device recording keeps exactly the columns it always had and stays
 comparable with older files.
 
-The session covers the whole setup: it opens as soon as **any** device reports a
-run starting, and closes only once **every** device that was running has
-stopped. Closing on the first stop would truncate the file while another
-instrument was still going. The banner shows how many devices are live
-(`2/2 devices`), and the device list marks each running one with a dot.
+### Which instrument decides when to record
+
+In a coupled rig only one instrument actually has a run. A TPD setup is an oven
+under Calisto with a mass spectrometer watching the evolved gas: the experiment
+is the oven's, while the analyser polls continuously and has no notion of a run
+at all.
+
+So each device has a **Its experiment drives recording** tick. Leave it on for
+the instrument running the experiment, and clear it for the ones just
+contributing data — they will never open or close a file, whatever their traffic
+does, but everything they report lands in the session while it is open.
+
+With more than one controlling device the file opens on the first to start and
+closes once all of them have stopped, since closing on the first would truncate
+it while another was still going. The banner shows how many devices are live
+(`1/2 devices`), and the device list marks each running one with a dot.
+
+Devices **without a profile still have their raw traffic recorded** into the
+session's `.raw.jsonl`, so an instrument you have not decoded yet is captured
+alongside the run and can be decoded afterwards.
 
 ## When you can't identify it yourself
 
