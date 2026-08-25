@@ -22,10 +22,15 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..capture.reassembly import C2S, S2C, StreamChunk
+from ..readers.modbus import FORMATS as MODBUS_FORMATS, RegisterSpec
 from .fields import decode_field
 from .framer import FramingSpec, TimedStream, apply_mask, split_frames
 
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
+
+# Where a device's values come from.
+SOURCE_SNIFF = "sniff"    # watch the vendor software's traffic, decode replies
+SOURCE_MODBUS = "modbus"  # ask the instrument's own Modbus slave for them
 
 
 @dataclass
@@ -86,6 +91,13 @@ class DeviceProfile:
     request_framing: FramingSpec
     signals: List[SignalSpec] = field(default_factory=list)
     interaction: str = "request_response"
+    # Most instruments are sniffed. One that computes its published numbers in
+    # software never puts them on the wire, and no amount of watching recovers
+    # them — but it may offer them through a Modbus slave, which exists to be
+    # asked. Such a device is read rather than watched.
+    source: str = SOURCE_SNIFF
+    modbus: dict = field(default_factory=dict)
+    registers: List["RegisterSpec"] = field(default_factory=list)
     # Only needed for devices that stream unprompted: with no request to pair
     # against, the reply stream has to be framed on its own.
     response_framing: Optional[FramingSpec] = None
@@ -104,6 +116,9 @@ class DeviceProfile:
             "ip_hint": self.ip_hint,
             "device_port": self.device_port,
             "interaction": self.interaction,
+            "source": self.source,
+            "modbus": self.modbus,
+            "registers": [r.to_dict() for r in self.registers],
             "request_framing": self.request_framing.to_dict(),
             "response_framing": (
                 self.response_framing.to_dict() if self.response_framing else None
@@ -128,6 +143,11 @@ class DeviceProfile:
             request_framing=FramingSpec.from_dict(d["request_framing"]),
             signals=[SignalSpec.from_dict(s) for s in d.get("signals", [])],
             interaction=d.get("interaction", "request_response"),
+            source=d.get("source", SOURCE_SNIFF),
+            modbus=d.get("modbus") or {},
+            registers=[
+                RegisterSpec.from_dict(r) for r in (d.get("registers") or [])
+            ],
             response_framing=FramingSpec.from_dict(response) if response else None,
             mac=d.get("mac", ""),
             ip_hint=d.get("ip_hint", ""),
@@ -173,6 +193,16 @@ class DeviceProfile:
                 f"interaction is {self.interaction!r}; expected "
                 "'request_response' or 'server_push'."
             )
+        if self.source not in (SOURCE_SNIFF, SOURCE_MODBUS):
+            problems.append(
+                f"source is {self.source!r}; expected "
+                f"'{SOURCE_SNIFF}' or '{SOURCE_MODBUS}'."
+            )
+
+        if self.is_modbus:
+            problems.extend(self._validate_modbus())
+            return problems
+
         if not self.signals:
             problems.append("The profile defines no signals, so it would record nothing.")
 
@@ -244,12 +274,75 @@ class DeviceProfile:
 
         return problems
 
+    def _validate_modbus(self) -> List[str]:
+        """Check a device that is read rather than watched."""
+        problems: List[str] = []
+        if not self.registers:
+            problems.append(
+                "This profile reads Modbus registers but lists none, so it "
+                "would record nothing."
+            )
+        framing = (self.modbus or {}).get("framing", "rtu_tcp")
+        if framing not in ("rtu_tcp", "tcp"):
+            problems.append(
+                f"modbus.framing is {framing!r}; expected 'rtu_tcp' (what "
+                "Questor5 calls RTU-TCP) or 'tcp' (standard Modbus TCP)."
+            )
+        unit = (self.modbus or {}).get("unit", 1)
+        if not isinstance(unit, int) or not 0 <= unit <= 247:
+            problems.append(f"modbus.unit is {unit!r}; expected 0 to 247.")
+
+        seen: Dict[str, int] = {}
+        for i, register in enumerate(self.registers):
+            where = f"register {i + 1} ({register.name})" if register.name else f"register {i + 1}"
+            if not register.name.strip():
+                problems.append(f"{where} has no name; the name becomes a CSV column.")
+            seen[register.name] = seen.get(register.name, 0) + 1
+            if register.format not in MODBUS_FORMATS:
+                problems.append(
+                    f"{where}: format {register.format!r} is not one of "
+                    + ", ".join(sorted(MODBUS_FORMATS))
+                    + "."
+                )
+            if not 0 <= register.address <= 65535 * 2:
+                problems.append(f"{where}: address {register.address} is out of range.")
+            if register.scale == 0:
+                problems.append(
+                    f"{where}: scale is 0, which would record every reading as "
+                    f"{register.bias}."
+                )
+            if register.format == "single" and register.scale_lo == register.scale_hi:
+                problems.append(
+                    f"{where}: scale_lo and scale_hi are equal, so every reading "
+                    "would decode to the same number. These must match the "
+                    "limits set in the vendor software exactly."
+                )
+        for name, count in seen.items():
+            if count > 1 and name.strip():
+                problems.append(
+                    f"The name {name!r} is used {count} times; each register "
+                    "needs its own CSV column."
+                )
+        return problems
+
     def signals_for(self, request: bytes) -> List[SignalSpec]:
         return [s for s in self.signals if s.matches(request)]
 
     @property
+    def is_modbus(self) -> bool:
+        return self.source == SOURCE_MODBUS
+
+    @property
     def signal_names(self) -> List[str]:
+        if self.is_modbus:
+            return [r.name for r in self.registers]
         return [s.name for s in self.signals]
+
+    @property
+    def signal_units(self) -> Dict[str, str]:
+        if self.is_modbus:
+            return {r.name: r.unit for r in self.registers}
+        return {s.name: s.unit for s in self.signals}
 
 
 def bundled_profile_dir() -> Path:

@@ -21,6 +21,7 @@ from .capture.capture import PacketPump
 from .capture.reassembly import C2S, StreamChunk
 from .protocol.framer import TimedStream, split_frames
 from .protocol.profile import DeviceProfile, LiveDecoder, Sample
+from .readers.modbus import ModbusClient, ModbusError
 from .protocol.session import Calibration, Observation, SessionDetector
 
 # Chunks retained per device for identification. Enough for a few hundred poll
@@ -71,13 +72,23 @@ class DeviceMonitor:
         self.running = False
         self.prefix = ""
         self._carry = bytearray()
+        # Only set for a device that is read rather than sniffed.
+        self.reader: Optional[ModbusClient] = None
+        self._next_read = 0.0
+        self.last_error: Optional[str] = None
         self.apply_profile(config.profile)
 
     # ----- configuration --------------------------------------------------
 
+    @property
+    def reads_registers(self) -> bool:
+        """True for a device that is asked for its values rather than watched."""
+        return bool(self.profile and self.profile.is_modbus)
+
     def apply_profile(self, profile: Optional[DeviceProfile]) -> None:
         self.config.profile = profile
-        self.decoder = LiveDecoder(profile) if profile else None
+        self.close_reader()
+        self.decoder = LiveDecoder(profile) if profile and not profile.is_modbus else None
         self.detector = (
             SessionDetector(Calibration.from_dict(profile.session or {}))
             if profile
@@ -99,12 +110,15 @@ class DeviceMonitor:
     def signal_names(self) -> List[str]:
         if not self.profile:
             return []
-        return [self.qualify(s.name) for s in self.profile.signals]
+        return [self.qualify(name) for name in self.profile.signal_names]
 
     def units(self) -> Dict[str, str]:
         if not self.profile:
             return {}
-        return {self.qualify(s.name): s.unit for s in self.profile.signals}
+        return {
+            self.qualify(name): unit
+            for name, unit in self.profile.signal_units.items()
+        }
 
     # ----- capture --------------------------------------------------------
 
@@ -113,22 +127,91 @@ class DeviceMonitor:
         return self.pump is not None
 
     def start_capture(self, interface: Optional[str]) -> None:
+        if self.reads_registers:
+            self.open_reader()
+            return
         self.pump = PacketPump(self.config.ip, self.config.port or None, interface)
         self.pump.start()
         self.analysis_buffer.clear()
         self._carry.clear()
 
     def stop_capture(self) -> None:
+        self.close_reader()
         pump, self.pump = self.pump, None
         if pump is not None:
             pump.stop()
 
+    def open_reader(self) -> None:
+        """Connect to the instrument's Modbus slave.
+
+        This is the one place the app opens a connection to an instrument. A
+        Modbus slave exists to be polled and normally accepts several masters,
+        so this does not take anything away from the vendor software the way
+        connecting to a single-client instrument would.
+        """
+        settings = (self.profile.modbus if self.profile else None) or {}
+        self.reader = ModbusClient(
+            self.config.ip,
+            self.config.port or 502,
+            unit=int(settings.get("unit", 1)),
+            framing=str(settings.get("framing", "rtu_tcp")),
+            timeout=float(settings.get("timeout_s", 3.0)),
+        )
+        self._next_read = 0.0
+        self.last_error = None
+
+    def close_reader(self) -> None:
+        reader, self.reader = getattr(self, "reader", None), None
+        if reader is not None:
+            reader.close()
+
     def status(self) -> str:
+        if self.reads_registers:
+            if self.last_error:
+                return f"read failed: {self.last_error}"
+            return "reading registers" if self.reader else "not reading"
         return self.pump.status() if self.pump else "not capturing"
 
     # ----- the loop -------------------------------------------------------
 
     def poll(self) -> PollResult:
+        """Produce whatever this device has to offer since the last call."""
+        if self.reads_registers:
+            return self._poll_registers()
+        return self._poll_capture()
+
+    def _poll_registers(self) -> PollResult:
+        """Ask the slave for its registers, no faster than configured.
+
+        A failed read is reported and retried rather than raised: an analyser
+        restarting mid-run should interrupt its own columns, not the recording
+        of the instrument that is driving the experiment.
+        """
+        import time as _time
+
+        result = PollResult()
+        if self.reader is None or not self.profile:
+            return result
+        now = _time.time()
+        if now < self._next_read:
+            return result
+        interval = float((self.profile.modbus or {}).get("poll_interval_s", 2.0))
+        self._next_read = now + max(0.2, interval)
+
+        try:
+            values = self.reader.read(self.profile.registers)
+            self.last_error = None
+        except (ModbusError, OSError) as e:
+            self.last_error = str(e)
+            self.reader.close()
+            return result
+        if values:
+            result.samples.append(
+                Sample(ts=now, values={self.qualify(k): v for k, v in values.items()})
+            )
+        return result
+
+    def _poll_capture(self) -> PollResult:
         """Drain captured packets into decoded samples and session events."""
         result = PollResult()
         if self.pump is None:

@@ -62,20 +62,25 @@ class FakePump:
         pass
 
 
+def configure(window, index, label, ip, profile="Setaram DSC (Setline)"):
+    """Fill in one device's panel the way a user would."""
+    form = window._device_forms[index]
+    assert form.select_profile(profile), f"{profile} must be loadable"
+    form.set_label(label)
+    form.set_address(ip)
+    form._emit_changed()
+    form.save()
+    return form
+
+
 @pytest.fixture
 def window(qapp, tmp_path, monkeypatch):
     from lan_sniffer.ui import main_window as mw
 
     monkeypatch.setattr(mw, "PROFILE_DIR", tmp_path / "profiles")
     w = mw.MainWindow()
-    index = w._profile_box.findText("Setaram DSC (Setline)")
-    assert index >= 0, "the DSC profile must be loadable"
-    w._profile_box.setCurrentIndex(index)
-    w._label_edit.setText("dsc")
-    w._on_label_changed()
     w._output_dir = tmp_path / "sessions"
-    w._device.setEditText("169.254.93.1")
-    w._save_device_form()
+    configure(w, 0, "dsc", "169.254.93.1")
     arm(w)
     yield w
     w.close()
@@ -198,13 +203,7 @@ def test_two_sessions_in_the_same_second_do_not_overwrite_each_other(window, tmp
 def add_second_device(window, label="dsc2"):
     """Watch a second instrument alongside the first."""
     window._add_device()
-    window._profile_box.setCurrentIndex(
-        window._profile_box.findText("Setaram DSC (Setline)")
-    )
-    window._label_edit.setText(label)
-    window._on_label_changed()
-    window._device.setEditText("169.254.93.2")
-    window._save_device_form()
+    configure(window, 1, label, "169.254.93.2")
     arm(window)
 
 
@@ -305,7 +304,7 @@ def test_the_file_stays_open_while_any_device_is_still_running(window):
 def test_removing_a_device_drops_its_columns(window):
     add_second_device(window)
     assert any(m.prefix for m in window._monitors)
-    window._remove_device()
+    window._remove_device(window._monitors[1])
     assert len(window._monitors) == 1
     # Back to one device, so the prefix goes away again.
     assert window._monitors[0].prefix == ""

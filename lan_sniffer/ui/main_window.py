@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QCheckBox,
+    QInputDialog,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -32,6 +33,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QScrollArea,
     QSplitter,
     QStatusBar,
     QVBoxLayout,
@@ -47,8 +49,9 @@ from ..capture.capture import (
 from ..capture.neighbors import arp_neighbors
 from ..capture.reassembly import StreamChunk
 from ..monitor import DeviceConfig, DeviceMonitor
-from ..protocol.framer import analyze_flow, group_chunks_by_flow
+from ..protocol.framer import FramingSpec, analyze_flow, group_chunks_by_flow
 from ..protocol.profile import (
+    SOURCE_MODBUS,
     DeviceProfile,
     build_profile,
     load_profiles,
@@ -58,6 +61,8 @@ from ..protocol.session import Calibration
 from ..writers.csv_writer import SessionCSVWriter
 from ..writers.raw_writer import RawWriter
 from .calibrate import CalibrateDialog
+from .device_form import DeviceForm
+from .modbus_setup import ModbusSetupDialog
 from .identify import IdentifyDialog
 from .live_view import LiveView
 
@@ -80,7 +85,7 @@ class MainWindow(QMainWindow):
         self._monitors: List[DeviceMonitor] = [
             DeviceMonitor(DeviceConfig(label="Device 1"))
         ]
-        self._current = 0
+        self._device_forms: List[DeviceForm] = []
         self._capturing = False
         self._csv: Optional[SessionCSVWriter] = None
         self._raw: Optional[RawWriter] = None
@@ -88,13 +93,14 @@ class MainWindow(QMainWindow):
         self._session_started: Optional[float] = None
         self._survey_raw: Optional[RawWriter] = None
         self._survey_base: Optional[Path] = None
+        self._survey_monitor: Optional[DeviceMonitor] = None
 
         self._build_ui()
         self._build_menu()
         self._check_readiness()
-        self._refresh_profiles()
-        self._refresh_device_picker()
-        self._load_device_form()
+        for monitor in self._monitors:
+            self._add_form(monitor)
+        self._update_controls()
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._poll)
@@ -212,114 +218,16 @@ class MainWindow(QMainWindow):
         self._readiness.setWordWrap(True)
         self._readiness.setTextFormat(Qt.RichText)
 
-        self._interface = QComboBox()
-        self._interface.setToolTip(
-            "Which network adapter to listen on. Capture sees only the traffic\n"
-            "crossing the adapter you pick, so this has to be the one the\n"
-            "instrument is connected through.\n\n"
-            "Leave it on automatic: the app matches the instrument's address\n"
-            "against each adapter's own address and picks the one on the same\n"
-            "link."
-        )
-        self._populate_interfaces()
-
-        self._device = QComboBox()
-        self._device.setEditable(True)
-        self._device.setMinimumWidth(220)
-        self._device.currentTextChanged.connect(self._on_device_changed)
-        self._device.editTextChanged.connect(self._on_device_changed)
-        refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self._refresh_devices)
-        device_row = QHBoxLayout()
-        device_row.addWidget(self._device, 1)
-        device_row.addWidget(refresh)
-
-        self._port = QSpinBox()
-        self._port.setRange(0, 65535)
-        self._port.setValue(1210)
-        self._port.setSpecialValueText("any")
-        self._port.setToolTip(
-            "Narrows the capture filter. Leave at 'any' if the port is unknown."
-        )
-
-        self._profile_box = QComboBox()
-        self._profile_box.currentIndexChanged.connect(self._on_profile_changed)
+        # Every device gets its own visible panel. A dropdown that swapped one
+        # shared form between them hid the device you were not looking at,
+        # which is the wrong shape for setting up a coupled rig.
+        self._device_area = QVBoxLayout()
+        self._device_area.setContentsMargins(0, 0, 0, 0)
+        self._add_device_btn = QPushButton("Add another device")
+        self._add_device_btn.clicked.connect(self._add_device)
 
         self._capture_btn = QPushButton("Start capture")
         self._capture_btn.clicked.connect(self._toggle_capture)
-
-        # One form shared by every device, with a selector above it. Duplicating
-        # the whole form per device would not fit the panel and would not scale
-        # past the two this was asked for.
-        self._device_picker = QComboBox()
-        self._device_picker.currentIndexChanged.connect(self._on_device_selected)
-        self._add_device_btn = QPushButton("Add")
-        self._remove_device_btn = QPushButton("Remove")
-        for button, tip in (
-            (self._add_device_btn, "Watch another instrument at the same time"),
-            (self._remove_device_btn, "Stop watching the selected instrument"),
-        ):
-            button.setToolTip(tip)
-        self._add_device_btn.clicked.connect(self._add_device)
-        self._remove_device_btn.clicked.connect(self._remove_device)
-        picker_row = QHBoxLayout()
-        picker_row.addWidget(self._device_picker, 1)
-        picker_row.addWidget(self._add_device_btn)
-        picker_row.addWidget(self._remove_device_btn)
-
-        self._controls_box = QCheckBox("Its experiment drives recording")
-        # Checked by default, and it must be set before anything saves the form:
-        # the profile dropdown fires during startup, and an unchecked box would
-        # be written back to every device before its own settings were loaded.
-        self._controls_box.setChecked(True)
-        self._controls_box.setToolTip(
-            "Tick this for the instrument that runs the experiment.\n\n"
-            "In a coupled setup only one instrument has a run: a TPD rig is an\n"
-            "oven under Calisto with a mass spectrometer watching the gas. The\n"
-            "oven decides when recording starts and stops; the analyser just\n"
-            "contributes its columns for that window."
-        )
-        self._controls_box.stateChanged.connect(self._on_controls_changed)
-
-        self._label_edit = QLineEdit()
-        self._label_edit.setPlaceholderText("a short name, e.g. dsc")
-        self._label_edit.setToolTip(
-            "Names this device's columns when more than one is being watched,\n"
-            "so two instruments reporting 'sample_temperature' stay apart."
-        )
-        self._label_edit.editingFinished.connect(self._on_label_changed)
-
-        device_group = QGroupBox("Devices")
-        form = QFormLayout(device_group)
-        form.addRow("Watching", picker_row)
-        form.addRow("Name", self._label_edit)
-        form.addRow("Interface", self._interface)
-        form.addRow("Address", device_row)
-        form.addRow("Port", self._port)
-        form.addRow("Profile", self._profile_box)
-        form.addRow(self._controls_box)
-        form.addRow(self._capture_btn)
-
-        self._identify_btn = QPushButton("Identify signals…")
-        self._identify_btn.clicked.connect(self._identify)
-        self._identify_btn.setToolTip(
-            "Analyse the traffic captured so far, then name what it finds."
-        )
-        self._calibrate_btn = QPushButton("Teach idle vs running…")
-        self._calibrate_btn.clicked.connect(self._calibrate)
-
-        self._import_btn = QPushButton("Import profile\u2026")
-        self._import_btn.clicked.connect(self._import_profile)
-        self._import_btn.setToolTip(
-            "Load a profile JSON written elsewhere \u2014 by hand, or by "
-            "something\nthat analysed a survey export."
-        )
-
-        setup_group = QGroupBox("Set up a device")
-        setup = QVBoxLayout(setup_group)
-        setup.addWidget(self._identify_btn)
-        setup.addWidget(self._calibrate_btn)
-        setup.addWidget(self._import_btn)
 
         self._banner = QLabel("\u25cb  NOT RECORDING")
         self._banner.setAlignment(Qt.AlignCenter)
@@ -327,12 +235,12 @@ class MainWindow(QMainWindow):
             "background:#e8e8e8; color:#555; font-weight:bold; font-size:15px; "
             "padding:9px; border-radius:4px;"
         )
-
         self._session_label = QLabel("No session.")
         self._session_label.setWordWrap(True)
         self._session_label.setTextFormat(Qt.RichText)
         self._session_label.setStyleSheet("color:#555; font-size:11px;")
         self._session_label.setMinimumHeight(46)
+
         self._start_btn = QPushButton("Start session")
         self._stop_btn = QPushButton("Stop session")
         self._split_btn = QPushButton("Split here")
@@ -342,38 +250,38 @@ class MainWindow(QMainWindow):
 
         self._output_label = QLabel(str(self._output_dir))
         self._output_label.setWordWrap(True)
-        choose_dir = QPushButton("Change folder…")
+        choose_dir = QPushButton("Change folder\u2026")
         choose_dir.clicked.connect(self._choose_output_dir)
 
         session_group = QGroupBox("Recording")
         session = QVBoxLayout(session_group)
-        self._survey_btn = QPushButton("Record everything (no profile)")
-        self._survey_btn.setCheckable(True)
-        self._survey_btn.clicked.connect(self._toggle_survey)
-        self._survey_btn.setToolTip(
-            "Record an unidentified device: every reading the scan finds "
-            "plausible,\nwith wall-clock timestamps and the raw reply bytes.\n\n"
-            "Produces a CSV and a companion JSON for analysis elsewhere \u2014 pair "
-            "it\nwith the instrument software's own export of the same run."
-        )
-
         session.addWidget(self._banner)
         session.addWidget(self._session_label)
-        session.addWidget(self._survey_btn)
         session.addWidget(self._start_btn)
         session.addWidget(self._stop_btn)
         session.addWidget(self._split_btn)
         session.addWidget(self._output_label)
         session.addWidget(choose_dir)
 
-        side = QWidget()
-        side_layout = QVBoxLayout(side)
+        inner = QWidget()
+        side_layout = QVBoxLayout(inner)
         side_layout.addWidget(self._readiness)
-        side_layout.addWidget(device_group)
-        side_layout.addWidget(setup_group)
+        side_layout.addLayout(self._device_area)
+        side_layout.addWidget(self._add_device_btn)
+        side_layout.addWidget(self._capture_btn)
         side_layout.addWidget(session_group)
         side_layout.addStretch(1)
-        side.setMaximumWidth(430)
+
+        # Two device panels plus the recording controls outgrow most windows,
+        # so the column scrolls rather than squeezing its contents.
+        side = QScrollArea()
+        side.setWidget(inner)
+        side.setWidgetResizable(True)
+        # A minimum as well as a maximum: with only a maximum the splitter
+        # collapsed the whole column to a sliver and gave the space to the plot.
+        side.setMinimumWidth(430)
+        side.setMaximumWidth(520)
+        side.setFrameShape(QScrollArea.NoFrame)
 
         self._live = LiveView()
 
@@ -381,16 +289,39 @@ class MainWindow(QMainWindow):
         splitter.addWidget(side)
         splitter.addWidget(self._live)
         splitter.setStretchFactor(1, 1)
+        splitter.setSizes([440, 900])
+        splitter.setCollapsible(0, False)
         self.setCentralWidget(splitter)
         self.setStatusBar(QStatusBar())
-        self._update_controls()
 
-    # ----- the device list -------------------------------------------------
+    # ----- the device panels ------------------------------------------------
 
-    @property
-    def _monitor(self) -> DeviceMonitor:
-        """The device the form is currently editing."""
-        return self._monitors[self._current]
+    def _add_form(self, monitor: DeviceMonitor) -> DeviceForm:
+        form = DeviceForm(monitor)
+        form.changed.connect(self._on_form_changed)
+        form.remove_requested.connect(self._remove_device)
+        form.identify_requested.connect(self._identify)
+        form.calibrate_requested.connect(self._calibrate)
+        form.import_requested.connect(self._import_profile)
+        form.modbus_requested.connect(self._setup_modbus)
+        form.survey_requested.connect(self._toggle_survey)
+        form.refresh_button.clicked.connect(lambda: self._refresh_devices(monitor))
+        self._device_forms.append(form)
+        self._device_area.addWidget(form)
+        self._populate_form(form)
+        form.load()
+        return form
+
+    def _populate_form(self, form: DeviceForm) -> None:
+        entries = [("(automatic)", None)]
+        entries += [(i.label(), i.name) for i in describe_interfaces()]
+        form.set_interfaces(entries)
+        profiles = [("(none \u2014 identify from traffic)", None)]
+        profiles += [(p.name, p) for p in load_profiles()]
+        form.set_profiles(profiles)
+
+    def _form_for(self, monitor: DeviceMonitor) -> Optional[DeviceForm]:
+        return next((f for f in self._device_forms if f.monitor is monitor), None)
 
     def _assign_prefixes(self) -> None:
         """Qualify signal names only when more than one device is watched.
@@ -402,103 +333,80 @@ class MainWindow(QMainWindow):
         for monitor in self._monitors:
             monitor.prefix = f"{_slug(monitor.name)}." if multiple else ""
 
-    def _refresh_device_picker(self) -> None:
-        self._device_picker.blockSignals(True)
-        self._device_picker.clear()
-        for i, monitor in enumerate(self._monitors):
-            mark = " \u25cf" if monitor.running else ""
-            self._device_picker.addItem(f"{monitor.name}{mark}", i)
-        self._device_picker.setCurrentIndex(self._current)
-        self._device_picker.blockSignals(False)
-        self._remove_device_btn.setEnabled(len(self._monitors) > 1)
-
-    def _on_device_selected(self, index: int) -> None:
-        if index < 0 or index >= len(self._monitors):
+    def _on_form_changed(self, monitor: DeviceMonitor) -> None:
+        form = self._form_for(monitor)
+        if form is None:
             return
-        self._save_device_form()
-        self._current = index
-        self._load_device_form()
+        form.save()
+        chosen = form.selected_profile()
+        if chosen is not monitor.profile:
+            monitor.apply_profile(chosen)
+            if chosen:
+                if chosen.device_port:
+                    form.set_port(chosen.device_port)
+                    monitor.config.port = chosen.device_port
+                if chosen.ip_hint and not monitor.config.ip:
+                    form.set_address(chosen.ip_hint)
+                    monitor.config.ip = chosen.ip_hint
+                if monitor.config.label.startswith("Device "):
+                    form.set_label(chosen.name)
+                    monitor.config.label = chosen.name
+        self._assign_prefixes()
+        self._refresh_live_signals()
+        self._update_automatic_labels()
+        for other in self._device_forms:
+            other.refresh_title()
+        self._update_controls()
+
+    def _update_automatic_labels(self) -> None:
+        """Show which adapter automatic mode settled on, per device.
+
+        Resolving it silently would leave a wrong guess indistinguishable from
+        a right one, and the wrong adapter captures perfectly while seeing
+        nothing.
+        """
+        for form in self._device_forms:
+            if form.monitor.reads_registers:
+                form.set_automatic_label("(not used when reading registers)")
+                continue
+            ip = form.selected_ip()
+            chosen = interface_for(ip) if ip else None
+            form.set_automatic_label(
+                f"(automatic \u2014 {chosen})" if chosen else "(automatic)"
+            )
 
     def _add_device(self) -> None:
-        self._save_device_form()
-        self._monitors.append(
-            DeviceMonitor(DeviceConfig(label=f"Device {len(self._monitors) + 1}"))
+        monitor = DeviceMonitor(
+            DeviceConfig(label=f"Device {len(self._monitors) + 1}")
         )
-        self._current = len(self._monitors) - 1
+        self._monitors.append(monitor)
+        self._add_form(monitor)
         self._assign_prefixes()
-        self._refresh_device_picker()
-        self._load_device_form()
         self._refresh_live_signals()
+        for form in self._device_forms:
+            form.refresh_title()
         if self._capturing:
             self.statusBar().showMessage(
                 "Added a device. Restart the capture to include it.", 8000
             )
         self._update_controls()
 
-    def _remove_device(self) -> None:
+    def _remove_device(self, monitor: DeviceMonitor) -> None:
         if len(self._monitors) < 2:
             return
-        monitor = self._monitors.pop(self._current)
         monitor.stop_capture()
-        self._current = min(self._current, len(self._monitors) - 1)
+        self._monitors.remove(monitor)
+        form = self._form_for(monitor)
+        if form is not None:
+            self._device_forms.remove(form)
+            self._device_area.removeWidget(form)
+            form.setParent(None)
+            form.deleteLater()
         self._assign_prefixes()
-        self._refresh_device_picker()
-        self._load_device_form()
         self._refresh_live_signals()
+        for other in self._device_forms:
+            other.refresh_title()
         self._update_controls()
-
-    def _load_device_form(self) -> None:
-        """Show the selected device's settings in the shared form."""
-        config = self._monitor.config
-        for widget in (
-            self._label_edit,
-            self._device,
-            self._port,
-            self._profile_box,
-            self._controls_box,
-        ):
-            widget.blockSignals(True)
-        self._label_edit.setText(config.label)
-        self._controls_box.setChecked(config.controls_recording)
-        self._device.setEditText(config.ip)
-        self._port.setValue(config.port or 0)
-        index = (
-            self._profile_box.findText(config.profile.name)
-            if config.profile
-            else 0
-        )
-        self._profile_box.setCurrentIndex(max(0, index))
-        for widget in (
-            self._label_edit,
-            self._device,
-            self._port,
-            self._profile_box,
-            self._controls_box,
-        ):
-            widget.blockSignals(False)
-
-        iface = self._interface.findData(config.interface)
-        self._interface.setCurrentIndex(iface if iface >= 0 else 0)
-        self._on_device_changed()
-
-    def _save_device_form(self) -> None:
-        """Write the form back to the selected device."""
-        config = self._monitor.config
-        config.label = self._label_edit.text().strip() or config.label
-        config.ip = self._selected_ip()
-        config.port = self._port.value() or None
-        config.interface = self._interface.currentData()
-        config.controls_recording = self._controls_box.isChecked()
-
-    def _on_controls_changed(self) -> None:
-        self._save_device_form()
-        self._update_session_label()
-
-    def _on_label_changed(self) -> None:
-        self._save_device_form()
-        self._assign_prefixes()
-        self._refresh_device_picker()
-        self._refresh_live_signals()
 
     def _refresh_live_signals(self) -> None:
         """Rebuild the plot for every signal on every configured device."""
@@ -509,12 +417,18 @@ class MainWindow(QMainWindow):
             units.update(monitor.units())
         self._live.set_signals(names, units)
 
+    def _refresh_profiles(self, select: Optional[str] = None) -> None:
+        for form in self._device_forms:
+            self._populate_form(form)
+        self._refresh_live_signals()
+        self._update_controls()
+
     # ----- readiness and devices -----------------------------------------
 
     def _check_readiness(self) -> None:
         state = capture_readiness()
         if state.ok:
-            text = f"<span style='color:#1a7f37'>Capture ready — {state.detail}.</span>"
+            text = f"<span style='color:#1a7f37'>Capture ready \u2014 {state.detail}.</span>"
             if state.warning:
                 text += f"<br><span style='color:#a04000'>{state.warning}</span>"
             self._readiness.setText(text)
@@ -522,89 +436,21 @@ class MainWindow(QMainWindow):
             self._readiness.setText(
                 f"<b style='color:#a04000'>Cannot capture: {state.detail}.</b>"
                 f"<br>{state.remedy}"
+                "<br><span style='color:#555'>A device read over Modbus does "
+                "not need this.</span>"
             )
         self._capture_ready = state.ok
 
-    def _populate_interfaces(self) -> None:
-        """Fill the adapter list, automatic first."""
-        self._interface.clear()
-        self._interface.addItem("(automatic)", None)
-        for iface in describe_interfaces():
-            self._interface.addItem(iface.label(), iface.name)
-
-    def _on_device_changed(self, *_args) -> None:
-        """Show which adapter automatic mode has settled on.
-
-        Resolving it silently would leave the user unable to tell a correct
-        guess from a wrong one, which matters because the wrong adapter
-        captures perfectly and sees nothing.
-        """
-        if self._interface.currentData() is not None:
-            return
-        ip = self._selected_ip()
-        chosen = interface_for(ip) if ip else None
-        label = "(automatic)" if not chosen else f"(automatic — {chosen})"
-        self._interface.setItemText(0, label)
-
-    def _resolved_interface(self) -> Optional[str]:
-        """The adapter to capture on: the explicit choice, or the best match."""
-        explicit = self._interface.currentData()
-        if explicit is not None:
-            return str(explicit)
-        return interface_for(self._selected_ip())
-
-    def _refresh_devices(self) -> None:
+    def _refresh_devices(self, monitor: Optional[DeviceMonitor] = None) -> None:
         neighbors, diagnostic = arp_neighbors()
-        current = self._device.currentText()
-        self._device.clear()
-        for n in neighbors:
-            self._device.addItem(f"{n.ip}  ({n.mac})", n.ip)
-        if current:
-            self._device.setEditText(current)
-        self._populate_interfaces()
-        self._on_device_changed()
+        entries = [(f"{n.ip}  ({n.mac})", n.ip) for n in neighbors]
+        for form in self._device_forms:
+            form.set_addresses(entries)
+            self._populate_form(form)
+        self._update_automatic_labels()
         self.statusBar().showMessage(
             diagnostic or f"{len(neighbors)} device(s) in the ARP cache", 6000
         )
-
-    def _selected_ip(self) -> str:
-        data = self._device.currentData()
-        if data:
-            return str(data)
-        return self._device.currentText().split()[0] if self._device.currentText() else ""
-
-    # ----- profiles -------------------------------------------------------
-
-    def _refresh_profiles(self, select: Optional[str] = None) -> None:
-        self._profile_box.blockSignals(True)
-        self._profile_box.clear()
-        self._profile_box.addItem("(none — identify from traffic)", None)
-        for profile in load_profiles():
-            self._profile_box.addItem(profile.name, profile)
-        self._profile_box.blockSignals(False)
-        if select:
-            index = self._profile_box.findText(select)
-            if index >= 0:
-                self._profile_box.setCurrentIndex(index)
-                return
-        self._on_profile_changed()
-
-    def _on_profile_changed(self) -> None:
-        profile = self._profile_box.currentData()
-        self._monitor.apply_profile(profile)
-        if profile:
-            if profile.device_port:
-                self._port.setValue(profile.device_port)
-            if profile.ip_hint and not self._device.currentText():
-                self._device.setEditText(profile.ip_hint)
-            if self._monitor.config.label.startswith("Device "):
-                # A freshly added device is better named after what it is.
-                self._label_edit.setText(profile.name)
-        self._save_device_form()
-        self._assign_prefixes()
-        self._refresh_device_picker()
-        self._refresh_live_signals()
-        self._update_controls()
 
     # ----- capture --------------------------------------------------------
 
@@ -613,11 +459,16 @@ class MainWindow(QMainWindow):
             self._stop_capture()
             return
 
-        if not self._capture_ready:
+        for form in self._device_forms:
+            form.save()
+
+        # Only a device that is watched needs the capture driver. A setup made
+        # entirely of instruments read over Modbus should not demand Npcap, or
+        # administrator rights, for something it never uses.
+        if any(not m.reads_registers for m in self._monitors) and not self._capture_ready:
             QMessageBox.warning(self, "Capture unavailable", self._readiness.text())
             return
 
-        self._save_device_form()
         unset = [m.name for m in self._monitors if not m.config.ip]
         if unset:
             QMessageBox.warning(
@@ -639,10 +490,16 @@ class MainWindow(QMainWindow):
                     already.stop_capture()
                 QMessageBox.critical(
                     self,
-                    "Could not start capture",
-                    f"{monitor.name}: {e}\n\nOn Windows this usually means Npcap "
-                    "is missing or the app is not running as Administrator. On "
-                    "macOS and Linux it usually means it was not run with sudo.",
+                    "Could not start",
+                    f"{monitor.name}: {e}\n\n"
+                    + (
+                        "Check that the instrument's Modbus slave is enabled "
+                        "and that the address, port and unit id match."
+                        if monitor.reads_registers
+                        else "On Windows this usually means Npcap is missing "
+                        "or the app is not running as Administrator; on macOS "
+                        "and Linux, that it was not run with sudo."
+                    ),
                 )
                 return
             started.append(monitor)
@@ -650,9 +507,8 @@ class MainWindow(QMainWindow):
         self._capturing = True
         self._poll_timer.start(POLL_INTERVAL_MS)
         self._redraw_timer.start(REDRAW_INTERVAL_MS)
-        self._capture_btn.setText("Stop capture")
         self.statusBar().showMessage(
-            "Capturing " + ", ".join(m.name for m in self._monitors)
+            "Running: " + ", ".join(m.name for m in self._monitors)
         )
         self._update_controls()
 
@@ -682,7 +538,7 @@ class MainWindow(QMainWindow):
             if result.chunks:
                 if self._raw is not None:
                     self._raw.add(result.chunks)
-                if self._survey_raw is not None and monitor is self._monitor:
+                if self._survey_raw is not None and monitor is self._survey_monitor:
                     self._survey_raw.add(result.chunks)
 
             for event, ts in result.events:
@@ -722,7 +578,7 @@ class MainWindow(QMainWindow):
         monitor.running = event == "start"
         if monitor.running == was_running:
             return
-        self._refresh_device_picker()
+        self._refresh_titles()
 
         if not monitor.config.controls_recording:
             return
@@ -737,8 +593,8 @@ class MainWindow(QMainWindow):
 
     # ----- identification and calibration ---------------------------------
 
-    def _identify(self) -> None:
-        if not self._monitor.analysis_buffer:
+    def _identify(self, monitor: DeviceMonitor) -> None:
+        if not monitor.analysis_buffer:
             QMessageBox.information(
                 self,
                 "Nothing captured yet",
@@ -749,7 +605,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        flows = group_chunks_by_flow(self._monitor.analysis_buffer)
+        flows = group_chunks_by_flow(monitor.analysis_buffer)
         largest = max(flows.values(), key=len)
         analysis = analyze_flow(largest)
         if not analysis.channels:
@@ -764,7 +620,7 @@ class MainWindow(QMainWindow):
         def refresh():
             # Re-analyse the buffer as it grows, so the dialog's values track
             # the instrument while the user is looking at them.
-            flows = group_chunks_by_flow(self._monitor.analysis_buffer)
+            flows = group_chunks_by_flow(monitor.analysis_buffer)
             if not flows:
                 return None
             return analyze_flow(max(flows.values(), key=len))
@@ -778,12 +634,12 @@ class MainWindow(QMainWindow):
             return
         profile = build_profile(
             name=name,
-            device_port=self._port.value(),
+            device_port=monitor.config.port or 0,
             request_framing=analysis.request_spec,
             chosen=dialog.selections(),
             interaction=analysis.interaction,
             response_framing=analysis.response_spec,
-            ip_hint=self._selected_ip(),
+            ip_hint=monitor.config.ip,
         )
         path = PROFILE_DIR / f"{_slug(name)}.json"
         profile.save(path)
@@ -799,12 +655,12 @@ class MainWindow(QMainWindow):
     def _ask_profile_name(self) -> Tuple[str, bool]:
         from PyQt5.QtWidgets import QInputDialog
 
-        suggestion = self._selected_ip() or "device"
+        suggestion = "device"
         return QInputDialog.getText(
             self, "Name this device", "Profile name:", QLineEdit.Normal, suggestion
         )
 
-    def _calibrate(self) -> None:
+    def _calibrate(self, monitor: DeviceMonitor) -> None:
         if not self._capturing:
             QMessageBox.information(
                 self,
@@ -815,7 +671,7 @@ class MainWindow(QMainWindow):
             return
 
         sink: List[Tuple[float, bytes]] = []
-        self._monitor.request_sink = sink
+        monitor.request_sink = sink
 
         def collect() -> List[Tuple[float, bytes]]:
             taken, sink[:] = list(sink), []
@@ -823,11 +679,11 @@ class MainWindow(QMainWindow):
 
         dialog = CalibrateDialog(collect, parent=self)
         accepted = dialog.exec_() == CalibrateDialog.Accepted
-        self._monitor.request_sink = None
+        monitor.request_sink = None
         if not accepted or dialog.result is None:
             return
 
-        if self._monitor.profile is None:
+        if monitor.profile is None:
             QMessageBox.information(
                 self,
                 "No profile to save it to",
@@ -836,24 +692,96 @@ class MainWindow(QMainWindow):
             )
             return
 
-        profile = self._monitor.profile
+        profile = monitor.profile
         profile.session = dialog.result.to_dict()
         profile.save(PROFILE_DIR / f"{_slug(profile.name)}.json")
-        self._monitor.apply_profile(profile)
+        monitor.apply_profile(profile)
         QMessageBox.information(
             self, "Calibration saved", dialog.result.explanation
         )
         self._update_controls()
 
+    # ----- reading a device over Modbus -----------------------------------
+
+    def _setup_modbus(self, monitor: DeviceMonitor) -> None:
+        """Configure a device whose software publishes values in registers.
+
+        There is no traffic to identify here, so the wizard does not apply.
+        What the dialog offers instead is a test read, because a wrong address
+        or word order returns numbers rather than an error and the only real
+        check is against the instrument's own display.
+        """
+        profile = monitor.profile
+        dialog = ModbusSetupDialog(
+            host=monitor.config.ip,
+            port=monitor.config.port or 502,
+            registers=list(profile.registers) if profile and profile.is_modbus else None,
+            settings=dict(profile.modbus) if profile and profile.is_modbus else None,
+            parent=self,
+        )
+        if dialog.exec_() != ModbusSetupDialog.Accepted:
+            return
+
+        name, ok = QInputDialog.getText(
+            self,
+            "Name this device",
+            "Profile name:",
+            QLineEdit.Normal,
+            (profile.name if profile and profile.is_modbus else "") or monitor.name,
+        )
+        if not ok or not name.strip():
+            return
+
+        built = DeviceProfile(
+            name=name.strip(),
+            device_port=dialog.port,
+            request_framing=FramingSpec(mode="single_segment"),
+            source=SOURCE_MODBUS,
+            modbus=dialog.settings(),
+            registers=dialog.registers(),
+            ip_hint=dialog.host,
+            notes=(
+                "Read from the instrument's own Modbus slave rather than "
+                "sniffed. The values are the ones its software computed."
+            ),
+        )
+        problems = built.validate()
+        if problems:
+            QMessageBox.critical(
+                self, "That configuration has problems", "\n".join(problems[:10])
+            )
+            return
+
+        built.save(PROFILE_DIR / f"{_slug(built.name)}.json")
+        monitor.config.ip = dialog.host
+        monitor.config.port = dialog.port
+        monitor.apply_profile(built)
+        self._refresh_profiles()
+        form = self._form_for(monitor)
+        if form is not None:
+            self._populate_form(form)
+            form.load()
+        self._assign_prefixes()
+        self._refresh_live_signals()
+        self._refresh_titles()
+        self._update_controls()
+        QMessageBox.information(
+            self,
+            "Ready to read",
+            f"'{built.name}' will read {len(built.registers)} register(s): "
+            + ", ".join(built.signal_names)
+            + ".\n\nStart the capture to begin.",
+        )
+
     # ----- survey recording -----------------------------------------------
 
-    def _toggle_survey(self) -> None:
+    def _toggle_survey(self, monitor: DeviceMonitor) -> None:
         if self._survey_raw is not None:
             self._finish_survey()
         else:
-            self._begin_survey()
+            self._begin_survey(monitor)
 
-    def _begin_survey(self) -> None:
+    def _begin_survey(self, monitor: DeviceMonitor) -> None:
         """Record an unidentified device to the raw sidecar.
 
         Only raw bytes are written while recording. The survey is produced from
@@ -867,20 +795,18 @@ class MainWindow(QMainWindow):
                 "Start the capture first",
                 "There is nothing to record until the capture is running.",
             )
-            self._survey_btn.setChecked(False)
             return
 
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        ip = self._selected_ip() or "device"
+        self._survey_monitor = monitor
+        ip = monitor.config.ip or "device"
         self._survey_base = self._output_dir / f"survey_{_slug(ip)}_{stamp}"
         self._survey_raw = RawWriter(
             Path(str(self._survey_base) + ".raw.jsonl"),
-            device_ip=self._selected_ip(),
-            device_port=self._port.value() or None,
-            note="survey recording (no profile)",
+            device_ip=monitor.config.ip,
+            device_port=monitor.config.port or None,
+            note=f"survey recording: {monitor.name}",
         )
-        self._survey_btn.setChecked(True)
-        self._survey_btn.setText("Stop and export survey")
         self.statusBar().showMessage(
             f"Recording everything to {self._survey_base.name}.raw.jsonl", 8000
         )
@@ -892,8 +818,6 @@ class MainWindow(QMainWindow):
 
         raw, self._survey_raw = self._survey_raw, None
         base, self._survey_base = self._survey_base, None
-        self._survey_btn.setChecked(False)
-        self._survey_btn.setText("Record everything (no profile)")
         if raw is None or base is None:
             return
 
@@ -917,8 +841,8 @@ class MainWindow(QMainWindow):
             csv_path, json_path = write_survey(
                 survey,
                 Path(str(base) + ".csv"),
-                device_ip=self._selected_ip(),
-                device_port=self._port.value() or None,
+                device_ip=self._monitors[0].config.ip,
+                device_port=self._monitors[0].config.port or None,
             )
         except Exception as e:
             QMessageBox.critical(
@@ -958,7 +882,7 @@ class MainWindow(QMainWindow):
 
     # ----- profile import -------------------------------------------------
 
-    def _import_profile(self) -> None:
+    def _import_profile(self, monitor: DeviceMonitor) -> None:
         """Load a profile written outside the app, refusing a broken one."""
         path, _filter = QFileDialog.getOpenFileName(
             self, "Import a profile", str(self._output_dir), "Profile JSON (*.json)"
@@ -1052,7 +976,7 @@ class MainWindow(QMainWindow):
                 # without a profile — so an instrument that could not be
                 # decoded yet is still recorded and can be decoded later.
                 device_ip=", ".join(m.config.ip for m in self._monitors if m.config.ip),
-                device_port=self._port.value() or None,
+                device_port=self._monitors[0].config.port or None,
                 note="; ".join(
                     f"{m.name}: {m.profile.name if m.profile else 'no profile'}"
                     for m in self._monitors
@@ -1100,7 +1024,7 @@ class MainWindow(QMainWindow):
                     monitor.detector.stop()
         for monitor in self._monitors:
             monitor.running = False
-        self._refresh_device_picker()
+        self._refresh_titles()
         self._update_controls()
 
     def _split_session(self) -> None:
@@ -1203,28 +1127,23 @@ class MainWindow(QMainWindow):
             )
         self._session_label.setToolTip("\n".join(detail))
 
+    def _refresh_titles(self) -> None:
+        for form in self._device_forms:
+            form.refresh_title()
+
     def _update_controls(self) -> None:
         capturing = self._capturing
         recording = self._csv is not None
-        self._survey_btn.setEnabled(capturing)
-        self._identify_btn.setEnabled(capturing)
-        self._calibrate_btn.setEnabled(capturing)
+        removable = len(self._monitors) > 1
+        for form in self._device_forms:
+            form.set_enabled_for_capture(capturing, removable)
+        self._add_device_btn.setEnabled(not capturing)
+
         has_profile = any(m.profile is not None for m in self._monitors)
         self._start_btn.setEnabled(capturing and not recording and has_profile)
         self._stop_btn.setEnabled(recording)
         self._split_btn.setEnabled(recording)
-        for widget in (
-            self._interface,
-            self._device,
-            self._port,
-            self._label_edit,
-            self._add_device_btn,
-            self._remove_device_btn,
-        ):
-            widget.setEnabled(not capturing)
-        self._remove_device_btn.setEnabled(
-            not capturing and len(self._monitors) > 1
-        )
+        self._capture_btn.setText("Stop capture" if capturing else "Start capture")
         self._update_session_label()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming

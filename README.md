@@ -111,8 +111,10 @@ fires at random; recording still works from the buttons.
 
 ## Watching two instruments at once
 
-Press **Add** next to *Watching* to add a device. Each gets its own name, address,
-adapter and profile, and each is captured separately — so two instruments on
+Press **Add another device**. Each gets its own panel — name, address, adapter,
+profile and its own setup buttons — and all of them stay visible, because
+setting up a coupled rig means comparing two instruments, not remembering the
+one a dropdown is hiding. Each is captured separately, so two instruments on
 different network adapters are fine.
 
 Everything else is shared. Both devices plot on the same chart and record into
@@ -144,6 +146,42 @@ it while another was still going. The banner shows how many devices are live
 Devices **without a profile still have their raw traffic recorded** into the
 session's `.raw.jsonl`, so an instrument you have not decoded yet is captured
 alongside the run and can be decoded afterwards.
+
+## Instruments that are read rather than watched
+
+Some instruments never transmit what their software displays. A process mass
+spectrometer streams raw detector data and computes concentrations in software,
+so watching the traffic recovers arrays and not values — searching every offset
+of every channel for them finds nothing, because they were never sent.
+
+Those instruments usually publish their results another way. **Read over
+Modbus…** on a device's panel configures the app to ask the instrument's own
+Modbus slave for its holding registers, which is how a process analyser is
+normally wired into a plant control system. The values that come back are the
+ones its software computed, exactly.
+
+Enter the register map configured in the vendor software, then press **Test
+read**. That check matters more than it looks: a wrong address, the wrong word
+order or the wrong framing all return *numbers* rather than an error, so the
+only real test is comparing them against the instrument's own display.
+
+Three register formats are supported. Prefer **ieee754** — a 32-bit float across
+two registers, needing nothing kept in sync. **single** stores one register
+scaled between limits, and requires this app to hold an exact copy of those
+limits; if they are ever changed on one side only, it returns wrong values with
+no indication.
+
+A device read this way needs no capture driver and no administrator rights, and
+it still shares the session, the plot and the file with the sniffed ones.
+
+### On connecting to an instrument
+
+Everything else here is passive and never transmits, because the instruments it
+was built for accept a single client and connecting would take it from the
+software running the experiment. A Modbus slave exists to be polled and normally
+accepts several, so reading one takes nothing away. The rule is kept where its
+reason applies and deliberately not extended to an endpoint provisioned for data
+output.
 
 ## When you can't identify it yourself
 
