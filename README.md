@@ -167,6 +167,28 @@ validated on the way in, and refused with a specific list of problems if
 anything is wrong, because most mistakes here decode to plausible-looking
 numbers rather than failing outright.
 
+## When the instrument never sends the numbers
+
+Some instruments do not transmit what their software displays. A process mass
+spectrometer streams raw detector arrays and computes concentrations from them
+in software — sniffing recovers the arrays, not the values, and no amount of
+scanning finds a number that was never on the wire.
+
+The goal still works, by another route. A session CSV carries capture-clock
+timestamps and the vendor export carries its own, so where the clocks agree the
+two can be joined on time: **File → Merge a vendor export into a session…**.
+Pick the session, pick the export, give its columns a prefix, and it writes a
+combined file.
+
+Readings are matched to the nearest sample within 30 s, never interpolated —
+these are measurements, and inventing values between two samples would put
+numbers in the file that no instrument ever reported. Rows outside the export's
+range are left blank rather than filled, and a merge that matches little says so.
+
+The export needs a column of **absolute dates and times**. A column of elapsed
+seconds cannot be lined up against a capture clock, and is refused rather than
+silently matching nothing.
+
 ## What a session produces
 
 | File | Contents |

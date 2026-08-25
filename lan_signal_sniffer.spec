@@ -47,6 +47,7 @@ a = Analysis(
         "lan_sniffer.writers.csv_writer",
         "lan_sniffer.writers.raw_writer",
         "lan_sniffer.writers.survey",
+        "lan_sniffer.writers.merge",
         "PyQt5",
         "PyQt5.QtCore",
         "PyQt5.QtGui",
@@ -110,7 +111,7 @@ if sys.platform == "darwin":
         icon=icon_path,
         bundle_identifier="il.ac.bgu.omervered.lansignalsniffer",
         info_plist={
-            "CFBundleShortVersionString": "0.7.0",
+            "CFBundleShortVersionString": "0.8.0",
             "NSHighResolutionCapable": True,
         },
     )

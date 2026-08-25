@@ -108,6 +108,14 @@ class MainWindow(QMainWindow):
     # ----- menu -----------------------------------------------------------
 
     def _build_menu(self) -> None:
+        file_menu = self.menuBar().addMenu("&File")
+        merge = file_menu.addAction("Merge a vendor export into a session\u2026")
+        merge.setToolTip(
+            "Add an instrument software's own exported columns to a recorded "
+            "session, joined on the clock."
+        )
+        merge.triggered.connect(self._merge_export)
+
         help_menu = self.menuBar().addMenu("&Help")
 
         check = help_menu.addAction("Check for updates…")
@@ -138,6 +146,64 @@ class MainWindow(QMainWindow):
             f"<a href='https://github.com/OmerVered1/lan-signal-sniffer'>"
             "github.com/OmerVered1/lan-signal-sniffer</a>",
         )
+
+    # ----- merging a vendor export ----------------------------------------
+
+    def _merge_export(self) -> None:
+        """Join an instrument software's own export onto a recorded session.
+
+        Not every instrument transmits the numbers its software publishes. A
+        process mass spectrometer streams raw detector arrays and computes the
+        concentrations in software, so sniffing recovers arrays and not values.
+        Where the clocks agree the two files can be joined on time instead,
+        which reaches the same combined table by another route.
+        """
+        from ..writers.merge import merge_into_session
+
+        session, _f = QFileDialog.getOpenFileName(
+            self, "Which recorded session?", str(self._output_dir), "Session CSV (*.csv)"
+        )
+        if not session:
+            return
+        export, _f = QFileDialog.getOpenFileName(
+            self,
+            "Which vendor export?",
+            str(Path(session).parent),
+            "Exports (*.csv *.txt *.tsv);;All files (*)",
+        )
+        if not export:
+            return
+
+        from PyQt5.QtWidgets import QInputDialog
+
+        prefix, ok = QInputDialog.getText(
+            self,
+            "Name these columns",
+            "Prefix for the export's columns, so the two instruments stay "
+            "apart (blank for none):",
+            QLineEdit.Normal,
+            "ms.",
+        )
+        if not ok:
+            return
+
+        out = Path(session).with_name(Path(session).stem + "_merged.csv")
+        try:
+            result = merge_into_session(
+                Path(session), Path(export), out, prefix=prefix.strip()
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Could not merge", str(e))
+            return
+
+        message = (
+            f"{result.rows} row(s) written, {result.matched} of them carrying a "
+            f"reading ({result.coverage:.0%}).\n\n"
+            f"Added: {', '.join(result.added_columns)}\n\nSaved as {out.name}"
+        )
+        if result.warnings:
+            message += "\n\n" + "\n".join(result.warnings)
+        QMessageBox.information(self, "Merged", message)
 
     # ----- construction --------------------------------------------------
 
