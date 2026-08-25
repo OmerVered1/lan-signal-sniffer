@@ -161,5 +161,93 @@ def test_empty_channel_does_not_crash():
     assert scan.warnings
 
 
+
+
+# ----- scales other than degrees and milliwatts -----------------------------
+
+
+def scientific_channel(n=200):
+    """Replies shaped like a process mass spectrometer's.
+
+    A little-endian millisecond clock, an ion current in amps, and a
+    percentage — the natural units of the instrument, two of which sit far
+    below anything a thermal analyser reports.
+    """
+    import math
+
+    payloads = []
+    for i in range(n):
+        body = bytearray(b"\x00" * 28)
+        struct.pack_into("<I", body, 11, 950_000_000 + i * 250)
+        struct.pack_into("<f", body, 19, 3.34e-7 + 2e-8 * math.sin(i / 40))
+        struct.pack_into("<f", body, 23, 117.40 + 0.5 * math.sin(i / 30))
+        payloads.append(bytes(body))
+    return payloads
+
+
+def test_an_ion_current_in_amps_is_found():
+    """Regression: the plausibility floor was set for degrees and milliwatts.
+
+    At 1e-3 it scored every ion current, vacuum pressure and similar reading
+    at zero, so on a mass spectrometer the real signals ranked below misaligned
+    noise and the top candidate was a clock.
+    """
+    scan = scan_channel(scientific_channel())
+    best = scan.candidates[0]
+    assert (best.offset, best.encoding) == (19, "f32le")
+    assert best.maximum < 1e-5, "this is an ion current, not a temperature"
+
+
+def test_a_percentage_alongside_it_is_also_found():
+    scan = scan_channel(scientific_channel())
+    top_two = {(c.offset, c.encoding) for c in scan.candidates[:2]}
+    assert (19, "f32le") in top_two and (23, "f32le") in top_two
+
+
+def test_a_counter_read_as_a_float_is_demoted():
+    """A clock advances at a constant rate; that is what marks it out."""
+    payloads = []
+    for i in range(200):
+        body = bytearray(b"\x00" * 8)
+        struct.pack_into("<I", body, 0, 950_000_000 + i * 250)
+        payloads.append(bytes(body))
+    everything = []
+    for cand in scan_channel(payloads).candidates:
+        everything.append(cand)
+        everything.extend(cand.alternatives)
+    clock = [c for c in everything if (c.offset, c.encoding) == (0, "f32le")]
+    assert clock and clock[0].is_counter, "a steadily advancing float is a clock"
+
+
+def test_a_slow_curve_is_not_mistaken_for_a_clock():
+    """The counterpart, and the more damaging error of the two.
+
+    A thermal wave sampled over 40 s of its 261 s period only ever rises, and
+    its slope varies by about a sixth. Condemning that dropped the C80's heat
+    flow off the candidate list entirely — and an absent signal cannot be
+    overruled by the user, while a clock sitting near the top plainly can.
+    """
+    channel = channel_named(synth.c80_capture(n_cycles=40), synth.C80_HF_CMD)
+    best = scan_channel(channel.payloads).candidates[0]
+    assert (best.offset, best.encoding) == (6, "f32be")
+    assert not best.is_counter
+
+
+def test_a_reading_spanning_many_decades_is_demoted():
+    """Widening the floor lets more misalignments look plausible; this is the
+    check that separates them again."""
+    import math
+
+    payloads = []
+    for i in range(120):
+        body = bytearray(b"\x00" * 8)
+        # A value sweeping twelve orders of magnitude: no sensor does this.
+        struct.pack_into("<f", body, 0, 10.0 ** (-14 + 12 * (i / 120)))
+        struct.pack_into("<f", body, 4, 25.0 + 0.5 * math.sin(i / 20))
+        payloads.append(bytes(body))
+    best = scan_channel(payloads).candidates[0]
+    assert best.offset == 4, "the steady reading should outrank the sweep"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

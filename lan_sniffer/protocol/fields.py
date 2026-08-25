@@ -43,7 +43,15 @@ FLOAT_MIN_NONZERO = 1e-20
 # Fraction of steps that must share one size before a field is called a counter.
 COUNTER_AGREEMENT = 0.90
 # Magnitudes a person would recognise as a physical quantity in its own unit.
-HUMAN_LO, HUMAN_HI = 1e-3, 1e6
+# The floor has to reach far below everyday engineering units: a mass
+# spectrometer reports ion currents in amps (1e-12 to 1e-5) and vacuum in mbar,
+# and a floor set for degrees and milliwatts scored every one of them at zero.
+HUMAN_LO, HUMAN_HI = 1e-12, 1e6
+# Decades a single channel's magnitude may span before it is treated as a
+# misalignment. Widening the floor above lets more misreads look plausible, and
+# this is what separates them again: no sensor varies a millionfold within one
+# capture, but a float read at the wrong offset routinely spans a dozen decades.
+MAX_DECADE_SPREAD = 6.0
 
 # (name, numpy dtype, byte width, is_float)
 ENCODINGS: Tuple[Tuple[str, str, int, bool], ...] = (
@@ -185,6 +193,32 @@ def score_series(values: np.ndarray, is_float: bool, width: int) -> Optional[dic
     # in a long capture must not disguise it. A quantised sensor is not caught
     # by this, because its steps are dominated by zeros or vary in size.
     diffs = np.diff(values)
+
+    # A reading that never reverses AND advances at a near-constant rate is a
+    # clock or a sequence number. This catches counters read as floats, where
+    # quantisation varies the step just enough to escape the constant-step test
+    # below.
+    #
+    # Both halves are needed. Monotonicity alone condemns real signals: a
+    # thermal wave sampled over less than half its period only ever rises, and
+    # penalising it for that lost the C80's heat flow. What a clock has and a
+    # curve does not is a slope that barely changes.
+    steps = np.abs(diffs)
+    # The tolerance is deliberately severe. Over a window shorter than its own
+    # period any smooth curve looks like a straight line — a thermal wave
+    # sampled for 40 s of a 261 s cycle has a slope that varies by only a sixth
+    # — and a loose threshold condemned exactly that, dropping the real heat
+    # flow off the list. A digital counter is far more uniform than any curve:
+    # its float step is constant to within one quantisation, so demanding near
+    # perfect uniformity separates the two without catching real signals.
+    is_clock = bool(
+        diffs.size >= 50
+        and (np.all(diffs >= 0) or np.all(diffs <= 0))
+        and np.count_nonzero(diffs) > diffs.size * 0.5
+        and float(np.mean(steps)) > 0
+        and float(np.std(steps)) <= 0.05 * float(np.mean(steps))
+    )
+
     is_counter = False
     if diffs.size >= MIN_SAMPLES - 1:
         steps, counts = np.unique(diffs, return_counts=True)
@@ -236,6 +270,15 @@ def score_series(values: np.ndarray, is_float: bool, width: int) -> Optional[dic
     distinct = int(np.unique(values).size)
     resolution = min(1.0, distinct / max(1.0, 0.25 * values.size))
 
+    # Span of the magnitudes, in decades, measured between percentiles so that
+    # a signal passing through zero is not judged by its closest approach.
+    spread_decades = 0.0
+    if nonzero.size >= MIN_SAMPLES:
+        low = float(np.percentile(nonzero, 5))
+        high = float(np.percentile(nonzero, 95))
+        if low > 0 and high > 0:
+            spread_decades = math.log10(high) - math.log10(low)
+
     # The width bonus applies to floats only. A narrow reading of a float's
     # bytes really is a fragment of the wider one, so preferring the wider
     # reading is right there. For integers the opposite holds: a wider reading
@@ -253,13 +296,15 @@ def score_series(values: np.ndarray, is_float: bool, width: int) -> Optional[dic
         # Keep it — a setpoint or serial number may be worth recording — but it
         # should never outrank a channel that actually moves.
         score *= 0.40
-    if is_counter:
+    if is_counter or is_clock:
         score *= 0.35
+    if spread_decades > MAX_DECADE_SPREAD:
+        score *= 0.25
 
     return {
         "score": float(score),
         "is_constant": bool(is_constant),
-        "is_counter": is_counter,
+        "is_counter": bool(is_counter or is_clock),
         "minimum": vmin,
         "maximum": vmax,
         "latest": float(values[-1]),
