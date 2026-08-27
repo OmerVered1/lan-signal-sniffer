@@ -17,7 +17,7 @@ import synth
 
 from lan_sniffer.protocol.framer import FramingSpec
 from lan_sniffer.protocol.profile import DeviceProfile, SignalSpec, build_profile
-from lan_sniffer.writers.survey import build_survey, write_survey
+from lan_sniffer.writers.survey import MAX_HEX_BYTES, build_survey, write_survey
 
 
 # ----- survey export --------------------------------------------------------
@@ -42,6 +42,24 @@ def test_survey_keeps_the_raw_bytes_for_anything_it_read_wrongly():
     ]
     assert hex_values
     assert all(len(h) == 20 for h in hex_values), "10 reply bytes as 20 hex chars"
+
+
+def test_a_huge_reply_does_not_put_the_whole_frame_on_every_row():
+    """A spectrometer answering with 28 KB put 56 KB of hex on each row.
+
+    The CSV exists to be opened in a spreadsheet and handed to someone; the
+    .raw.jsonl beside it is what keeps every byte.
+    """
+    request = bytes.fromhex("53000000")
+    exchanges = [
+        (float(i), request, i + 0.01, bytes((i + j) % 256 for j in range(4000)))
+        for i in range(30)
+    ]
+    survey = build_survey(synth.build_capture(exchanges))
+    values = [v["ch0:hex"] for _ts, v in survey.samples if "ch0:hex" in v]
+    assert values
+    assert all(len(h) == MAX_HEX_BYTES * 2 + 3 for h in values)
+    assert all(h.endswith("...") for h in values), "truncation must be visible"
 
 
 def test_survey_exports_alternatives_not_only_the_top_pick():

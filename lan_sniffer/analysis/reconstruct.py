@@ -44,6 +44,11 @@ MIN_ARRAY_BYTES = 512
 # Samples needed before a correlation means anything. A vendor logging every
 # few seconds gives a few hundred over a half-hour run.
 MIN_PAIRED_SAMPLES = 20
+# How far into a reply the scalar sweep goes. Generous, because the last search
+# of this kind looked at a kilobyte of a 28 KB frame and concluded the values
+# were not being sent. Beyond this the array search is the one that applies,
+# and `analyse` says so rather than letting the limit pass unmentioned.
+MAX_SCALAR_BYTES = 2048
 # How far a vendor reading may sit from a frame and still be paired with it.
 DEFAULT_TOLERANCE_S = 15.0
 # A band grows outwards from its peak while indices stay this good, relative to
@@ -209,10 +214,16 @@ def build_array_channels(
                 count = (modal - offset) // size
                 if count < 16:
                     continue
-                block = np.frombuffer(
-                    b"".join(p[offset : offset + count * size] for _t, p in kept),
-                    dtype=dtype,
-                ).astype(np.float64)
+                # Reading at the wrong alignment produces infinities, which
+                # numpy warns about on the way to float64. That is expected
+                # here — the whole method is to try every alignment and let
+                # correlation reject the nonsense — so the warning is silenced
+                # rather than allowed to stop the sweep.
+                with np.errstate(invalid="ignore", over="ignore"):
+                    block = np.frombuffer(
+                        b"".join(p[offset : offset + count * size] for _t, p in kept),
+                        dtype=dtype,
+                    ).astype(np.float64)
                 matrix = block.reshape(len(kept), count)
                 if not np.all(np.isfinite(matrix)):
                     continue
@@ -274,10 +285,10 @@ def pair_with_vendor(
 
 def _correlate_columns(matrix: np.ndarray, target: np.ndarray) -> np.ndarray:
     """Pearson r between every column of `matrix` and `target`."""
-    m = matrix - matrix.mean(axis=0, keepdims=True)
-    t = target - target.mean()
-    denom = np.sqrt((m ** 2).sum(axis=0) * (t ** 2).sum())
-    with np.errstate(invalid="ignore", divide="ignore"):
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        m = matrix - matrix.mean(axis=0, keepdims=True)
+        t = target - target.mean()
+        denom = np.sqrt((m ** 2).sum(axis=0) * (t ** 2).sum())
         r = (m * t[:, None]).sum(axis=0) / denom
     return np.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -301,7 +312,10 @@ def _fit_holdout(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float, flo
     """
     n = len(x)
     cut = max(2, n // 2)
-    a, b = np.polyfit(x[:cut], y[:cut], 1)
+    with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+        a, b = np.polyfit(x[:cut], y[:cut], 1)
+    if not (np.isfinite(a) and np.isfinite(b)):
+        return 0.0, 0.0, 0.0, 0.0
     predicted = a * x[cut:] + b
     actual = y[cut:]
     if len(actual) < 2 or np.std(actual) == 0:
@@ -367,7 +381,7 @@ def find_scalars(
     replies: Dict[str, List[Tuple[float, bytes]]],
     vendor: Sequence[Tuple[datetime, Dict[str, str]]],
     columns: Sequence[str],
-    max_bytes: int = 256,
+    max_bytes: int = MAX_SCALAR_BYTES,
     tolerance_s: float = DEFAULT_TOLERANCE_S,
 ) -> List[ScalarFit]:
     """Look for a plain field that tracks each vendor column.
@@ -396,13 +410,15 @@ def find_scalars(
                 continue
             for name, dtype, size in ELEMENTS:
                 for offset in range(0, width - size + 1):
-                    block = np.frombuffer(
-                        b"".join(p[offset : offset + size] for _t, p in kept),
-                        dtype=dtype,
-                    ).astype(np.float64)[rows]
+                    with np.errstate(invalid="ignore", over="ignore"):
+                        block = np.frombuffer(
+                            b"".join(p[offset : offset + size] for _t, p in kept),
+                            dtype=dtype,
+                        ).astype(np.float64)[rows]
                     if not np.all(np.isfinite(block)) or np.std(block) == 0:
                         continue
-                    r = float(np.corrcoef(block, target)[0, 1])
+                    with np.errstate(invalid="ignore", divide="ignore"):
+                        r = float(np.corrcoef(block, target)[0, 1])
                     if not np.isfinite(r) or abs(r) < 0.9:
                         continue
                     a, b, r_out, r2_out = _fit_holdout(block, target)
@@ -444,15 +460,35 @@ def analyse(
             f"{MIN_ARRAY_BYTES} bytes; only the scalar search can apply"
         )
 
+    deep = sorted(
+        {
+            max(len(p) for _t, p in samples)
+            for samples in replies.values()
+            if samples and max(len(p) for _t, p in samples) > MAX_SCALAR_BYTES
+        }
+    )
+    if deep:
+        report.notes.append(
+            f"{len(deep)} channel(s) reply with up to {deep[-1]} bytes; the "
+            f"scalar sweep covers the first {MAX_SCALAR_BYTES} of each, and "
+            "the rest is searched as arrays"
+        )
+
     report.scalars = find_scalars(replies, vendor, columns, tolerance_s=tolerance_s)
     report.bands = find_bands(report.arrays, vendor, columns, tolerance_s=tolerance_s)
 
     for column in columns:
-        varied = [
-            float(v[1][column])
-            for v in vendor
-            if v[1].get(column, "").strip() not in ("", "nan")
-        ]
+        varied = []
+        for _ts, row in vendor:
+            text = row.get(column, "").strip()
+            if text in ("", "nan"):
+                continue
+            try:
+                varied.append(float(text))
+            except ValueError:
+                # A text column in the export. Not something to correlate, and
+                # not a reason to abandon the columns either side of it.
+                continue
         if len(varied) > 2:
             lo, hi = min(varied), max(varied)
             if lo != 0 and hi / max(abs(lo), 1e-30) < 1.1:

@@ -38,6 +38,13 @@ CANDIDATES_PER_CHANNEL = 12
 SCHEMA_NOTE = "https://github.com/OmerVered1/lan-signal-sniffer"
 
 
+# Bytes of each reply carried in the CSV's hex column. A spectrometer answering
+# with a 28 KB frame put 56 KB of hex on every row, which made the file
+# unopenable in the spreadsheet it exists to be opened in. The `.raw.jsonl`
+# beside it keeps every byte, so nothing is lost by trimming what the CSV shows.
+MAX_HEX_BYTES = 512
+
+
 @dataclass
 class SurveyColumn:
     """One exported column: a candidate field, or a channel's raw bytes."""
@@ -59,10 +66,15 @@ class SurveyColumn:
             return {
                 "column": self.name,
                 "channel": self.channel_signature,
-                "content": "raw reply bytes, hex",
+                "content": (
+                    f"raw reply bytes, hex, first {MAX_HEX_BYTES} bytes only"
+                ),
                 "note": (
                     "Decode this yourself if none of the numeric columns match. "
-                    "Every candidate column below is a reading of these bytes."
+                    "Every candidate column below is a reading of these bytes. "
+                    "Replies longer than this are cut short here and marked "
+                    "with a trailing ellipsis; the .raw.jsonl beside this file "
+                    "holds them in full."
                 ),
             }
         return {
@@ -177,7 +189,10 @@ def build_survey(chunks: Sequence, max_candidates: int = CANDIDATES_PER_CHANNEL)
             )
 
         for i, (ts, payload) in enumerate(zip(channel.timestamps, channel.payloads)):
-            values: Dict[str, object] = {raw_column.name: payload.hex()}
+            shown = payload[:MAX_HEX_BYTES].hex()
+            if len(payload) > MAX_HEX_BYTES:
+                shown += "..."
+            values: Dict[str, object] = {raw_column.name: shown}
             for column, series in decoded:
                 value = series[i]
                 if value == value:  # not NaN
@@ -237,8 +252,10 @@ def _metadata(survey: Survey, device_ip: str, device_port: Optional[int]) -> dic
             "encoding' column is one way of reading that channel's reply; "
             "columns from the same channel that overlap in bytes are competing "
             "readings of the same field, not separate measurements.",
-            "'chN:hex' is the untouched reply. If no numeric column matches a "
-            "known trace, the value is in there and was read the wrong way.",
+            "'chN:hex' is the reply as it arrived, cut to the first "
+            f"{MAX_HEX_BYTES} bytes and marked with '...' when it was longer. "
+            "If no numeric column matches a known trace, the value is in there "
+            "and was read the wrong way \u2014 the .raw.jsonl holds every byte.",
             "plausibility_score is this app's guess, nothing more. A low score "
             "on a column that matches a known trace means the guess was wrong.",
             "To find where an experiment starts, compare against the vendor "

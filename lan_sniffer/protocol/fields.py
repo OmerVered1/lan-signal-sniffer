@@ -32,7 +32,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 # Payload lengths beyond this are not swept exhaustively; the scan is O(len).
-MAX_SCAN_PAYLOAD = 1024
+# Raised well past the original kilobyte: an instrument that answers with a
+# 28 KB frame had all but its first kilobyte ignored, so anything living deeper
+# in the reply could not be found at all. The warning when it does truncate is
+# what keeps that visible.
+MAX_SCAN_PAYLOAD = 16384
 # Too few samples and every reading looks smooth by accident.
 MIN_SAMPLES = 8
 

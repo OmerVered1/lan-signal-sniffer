@@ -149,13 +149,16 @@ alongside the run and can be decoded afterwards.
 
 ## Instruments that are read rather than watched
 
-Some instruments never transmit what their software displays. A process mass
-spectrometer streams raw detector data and computes concentrations in software,
-so watching the traffic recovers arrays and not values — searching every offset
-of every channel for them finds nothing, because they were never sent.
+Some instruments compute in software what they display. A process mass
+spectrometer streams detector data and derives concentrations from it, so the
+numbers on screen may be assembled after the traffic rather than carried by it.
+Whether that is true of a particular instrument is a question to settle by
+searching, not by assuming — see *Finding values that don't look like values*
+below, which exists because the first search here stopped a kilobyte into a
+28 KB reply and reported the wrong answer.
 
-Those instruments usually publish their results another way. **Read over
-Modbus…** on a device's panel configures the app to ask the instrument's own
+Where the values genuinely are not on the wire, instruments like these usually
+publish them another way. **Read over Modbus…** on a device's panel configures the app to ask the instrument's own
 Modbus slave for its holding registers, which is how a process analyser is
 normally wired into a plant control system. The values that come back are the
 ones its software computed, exactly.
@@ -205,14 +208,46 @@ validated on the way in, and refused with a specific list of problems if
 anything is wrong, because most mistakes here decode to plausible-looking
 numbers rather than failing outright.
 
+## Finding values that don't look like values
+
+An instrument can be sending a reading without sending the *number*. It may hold
+it in raw counts, scale it before display, or bury it in a spectrum where the
+value is a band of indices the software integrates. Searching for the published
+figure finds none of these, because none of them equals it.
+
+`tools/find_values.py` searches for the relationship instead. Give it a capture
+and the vendor software's own export of the same period:
+
+```bash
+python tools/find_values.py session.raw.jsonl questor.csv
+```
+
+For every column in the export it sweeps every byte offset and every encoding of
+every channel, and every index of any array-shaped reply, looking for something
+whose *shape over time* tracks the published column. It then fits a scale and
+offset — and scores that fit on a stretch of the run it was **not** fitted on,
+because a scale and offset can be made to match almost anything over the window
+used to choose them.
+
+It reports what it found and where, and says plainly when it found nothing. It
+also says when a column never varied enough to be identifiable at all, which is
+a different answer from *not present* and gets confused with it constantly.
+
+Two limits used to make this search lie. The field sweep stopped after the first
+kilobyte, so a 28 KB reply was 96% unread; and the survey CSV carried each
+reply's full hex, which made a large-frame export unopenable. Both are fixed —
+the sweep reaches much further, says how deep it went, and the CSV keeps the
+first 512 bytes with the `.raw.jsonl` holding the rest.
+
+A capture minutes long is worth far more than one seconds long here: a channel
+that publishes every 8 seconds contributes two samples to a 20-second capture,
+and nothing can be identified from two samples.
+
 ## When the instrument never sends the numbers
 
-Some instruments do not transmit what their software displays. A process mass
-spectrometer streams raw detector arrays and computes concentrations from them
-in software — sniffing recovers the arrays, not the values, and no amount of
-scanning finds a number that was never on the wire.
-
-The goal still works, by another route. A session CSV carries capture-clock
+If the search above comes back empty on a run where the values genuinely moved,
+they are not derivable from the traffic and the goal still works by another
+route. A session CSV carries capture-clock
 timestamps and the vendor export carries its own, so where the clocks agree the
 two can be joined on time: **File → Merge a vendor export into a session…**.
 Pick the session, pick the export, give its columns a prefix, and it writes a
@@ -285,7 +320,7 @@ rediscovers the C80's channels on its own.
 python -m pytest tests/ -q
 ```
 
-92 tests, no hardware and no capture driver needed — the decoding engine is pure
+250 tests, no hardware and no capture driver needed — the decoding engine is pure
 functions over byte streams. Synthetic fixtures cover all four protocol shapes
 (C80-style fixed binary, Modbus/TCP with a transaction counter, SCPI text, and an
 unprompted stream), and are built by pushing real segments through the real
