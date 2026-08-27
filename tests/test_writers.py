@@ -166,3 +166,57 @@ def test_a_newer_sidecar_format_is_refused(tmp_path):
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ----- two instruments, one file --------------------------------------------
+
+
+def test_the_sidecar_remembers_which_instrument_each_chunk_came_from(tmp_path):
+    """A flow names the PC, which is the same for every device being watched.
+
+    Both instruments in a coupled rig record into one sidecar. Without the
+    device on each record their traffic is indistinguishable afterwards, and
+    decoding the file would analyse two instruments as one.
+    """
+    from lan_sniffer.capture.reassembly import TCPReassembler
+    from lan_sniffer.writers.raw_writer import RawWriter, read_raw
+
+    oven = TCPReassembler("169.254.60.1")
+    spectrometer = TCPReassembler("172.16.0.1")
+    chunks = []
+    for i in range(4):
+        chunks += oven.add_segment(
+            float(i), "10.0.0.5", 51234, "169.254.60.1", 1210, 1000 + i * 2, b"ov"
+        )
+        chunks += spectrometer.add_segment(
+            i + 0.5, "10.0.0.5", 51235, "172.16.0.1", 30000, 2000 + i * 2, b"ms"
+        )
+
+    path = tmp_path / "both.raw.jsonl"
+    with RawWriter(path, device_ip="169.254.60.1, 172.16.0.1") as writer:
+        writer.add(chunks)
+
+    back = list(read_raw(path))
+    assert len(back) == len(chunks)
+    assert {c.device_ip for c in back} == {"169.254.60.1", "172.16.0.1"}
+    assert all(c.data == b"ov" for c in back if c.device_ip == "169.254.60.1")
+    assert all(c.data == b"ms" for c in back if c.device_ip == "172.16.0.1")
+
+
+def test_two_instruments_are_not_analysed_as_one(tmp_path):
+    from lan_sniffer.capture.reassembly import TCPReassembler
+    from lan_sniffer.protocol.framer import group_chunks_by_flow
+
+    oven = TCPReassembler("169.254.60.1")
+    spectrometer = TCPReassembler("172.16.0.1")
+    chunks = []
+    for i in range(4):
+        # Same peer, same peer port, same device port: only the device differs.
+        chunks += oven.add_segment(
+            float(i), "10.0.0.5", 51234, "169.254.60.1", 1210, 1000 + i * 2, b"ov"
+        )
+        chunks += spectrometer.add_segment(
+            i + 0.5, "10.0.0.5", 51234, "172.16.0.1", 1210, 2000 + i * 2, b"ms"
+        )
+
+    assert len(group_chunks_by_flow(chunks)) == 2, "one bucket would merge them"

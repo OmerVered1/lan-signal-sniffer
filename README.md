@@ -147,6 +147,12 @@ Devices **without a profile still have their raw traffic recorded** into the
 session's `.raw.jsonl`, so an instrument you have not decoded yet is captured
 alongside the run and can be decoded afterwards.
 
+Each chunk in the `.raw.jsonl` records **which instrument sent it**, so one
+file holding two devices can be taken apart again afterwards. A flow is
+identified by the peer — the PC — which is the same for every device being
+watched, so without this the two streams would be indistinguishable and get
+decoded as one instrument.
+
 A session can be started with **no profile on any device**. There is nothing to
 put in a CSV column then, and the banner says `raw only` rather than reporting
 zero rows — but every byte still lands in the `.raw.jsonl`, which is the whole
@@ -327,7 +333,7 @@ rediscovers the C80's channels on its own.
 python -m pytest tests/ -q
 ```
 
-254 tests, no hardware and no capture driver needed — the decoding engine is pure
+257 tests, no hardware and no capture driver needed — the decoding engine is pure
 functions over byte streams. Synthetic fixtures cover all four protocol shapes
 (C80-style fixed binary, Modbus/TCP with a transaction counter, SCPI text, and an
 unprompted stream), and are built by pushing real segments through the real

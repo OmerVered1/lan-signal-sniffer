@@ -241,3 +241,28 @@ def test_a_capture_too_short_to_settle_the_question_says_so():
     """An empty result from eighteen seconds is not evidence of absence."""
     report = analyse(capture_with_scalar(n=25), vendor_export(n=25), ["V1_I_18"])
     assert any("covers only" in note for note in report.notes), report.notes
+
+
+def test_two_instruments_in_one_capture_keep_their_channels_apart():
+    """Channel numbering restarts per flow, so ch0 exists on both."""
+    from lan_sniffer.capture.reassembly import TCPReassembler
+
+    chunks = []
+    for name, ip, port in (("ov", "169.254.60.1", 1210), ("ms", "172.16.0.1", 30000)):
+        asm = TCPReassembler(ip)
+        c_seq = s_seq = 1000
+        for i in range(30):
+            req = b"\x52\x00\x00\x00"
+            chunks += asm.add_segment(BASE + i, "10.0.0.5", 51234, ip, port, c_seq, req)
+            c_seq += len(req)
+            reply = name.encode() * 12
+            chunks += asm.add_segment(
+                BASE + i + 0.01, ip, port, "10.0.0.5", 51234, s_seq, reply
+            )
+            s_seq += len(reply)
+
+    replies = channels_from_chunks(chunks)
+    assert len(replies) == 2, f"expected one channel per device, got {list(replies)}"
+    for key, samples in replies.items():
+        bodies = {p for _t, p in samples}
+        assert len(bodies) == 1, f"{key} mixed two instruments' replies together"

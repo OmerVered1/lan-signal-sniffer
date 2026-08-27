@@ -183,10 +183,16 @@ def channels_from_chunks(chunks: Sequence[StreamChunk]) -> Dict[str, List[Tuple[
     exactly what the recorder would see.
     """
     grouped: Dict[str, List[Tuple[float, bytes]]] = {}
-    for flow_chunks in group_chunks_by_flow(chunks).values():
+    groups = group_chunks_by_flow(chunks)
+    # Channel numbering restarts per flow, so with two instruments in one file
+    # their ch0s would land in the same bucket and be correlated as one series.
+    devices = {c.device_ip for c in chunks if c.device_ip}
+    label = len(devices) > 1
+    for (device, _flow), flow_chunks in groups.items():
         analysis = analyze_flow(flow_chunks)
+        prefix = f"{device}/" if label and device else ""
         for index, channel in enumerate(analysis.channels):
-            key = f"ch{index}:{channel.signature_hex}"
+            key = f"{prefix}ch{index}:{channel.signature_hex}"
             grouped.setdefault(key, [])
             for ts, payload in zip(channel.timestamps, channel.payloads):
                 grouped[key].append((ts, payload))

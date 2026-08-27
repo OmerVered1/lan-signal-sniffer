@@ -65,6 +65,13 @@ class RawWriter:
             }
             if chunk.gap_before:
                 record["gap"] = chunk.gap_before
+            if chunk.device_ip:
+                # Two instruments record into one file and a chunk's flow names
+                # the PC, not the instrument. Without this the streams cannot be
+                # told apart afterwards. Optional rather than versioned: an
+                # older reader ignores it, and a file written without it still
+                # loads.
+                record["dev"] = chunk.device_ip
             self._handle.write(json.dumps(record) + "\n")
             self.chunks_written += 1
             self.bytes_written += len(chunk.data)
@@ -116,6 +123,7 @@ def read_raw(path: Path) -> Iterator[StreamChunk]:
                 data=bytes.fromhex(record["data"]),
                 stream_offset=int(record["off"]),
                 gap_before=int(record.get("gap", 0)),
+                device_ip=str(record.get("dev", "")),
             )
 
 

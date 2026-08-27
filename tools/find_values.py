@@ -46,6 +46,10 @@ def main() -> int:
         help="seconds a reading may sit from a frame and still be paired",
     )
     parser.add_argument("--column", action="append", help="limit to one column")
+    parser.add_argument(
+        "--device",
+        help="with two instruments in one capture, search only this one (by IP)",
+    )
     args = parser.parse_args()
 
     source = Path(args.capture)
@@ -58,6 +62,14 @@ def main() -> int:
         replies = channels_from_survey(source)
         total = sum(len(v) for v in replies.values())
         print(f"capture: {len(replies)} channels, {total} replies (from the CSV)")
+    if args.device and replies is not None:
+        replies = {k: v for k, v in replies.items() if k.startswith(args.device + "/")}
+    elif args.device:
+        chunks = [c for c in chunks if c.device_ip == args.device]
+        if not chunks:
+            print(f"no traffic in this capture came from {args.device}")
+            return 1
+
     columns, samples = load_export(Path(args.export), args.tz_offset)
     wanted = args.column or columns
     print(f"export : {len(samples)} rows, columns {', '.join(columns)}")

@@ -73,6 +73,12 @@ class StreamChunk:
     is set when bytes were lost ahead of this chunk (capture drop or a stretch
     we gave up waiting for), which tells downstream decoders that frame
     alignment may have been broken.
+
+    `device_ip` names the instrument this chunk belongs to. A flow is keyed on
+    the *peer*, which is the PC — identical for every device the app watches —
+    so with two instruments recorded into one file this is the only thing that
+    tells their traffic apart. Empty when read back from a sidecar written
+    before it was recorded.
     """
 
     ts: float
@@ -81,6 +87,7 @@ class StreamChunk:
     data: bytes
     stream_offset: int
     gap_before: int = 0
+    device_ip: str = ""
 
 
 @dataclass
@@ -242,6 +249,7 @@ class TCPReassembler:
                 data=payload,
                 stream_offset=state.stream_offset,
                 gap_before=gap,
+                device_ip=self._device_ip,
             )
         )
         state.stream_offset += len(payload)

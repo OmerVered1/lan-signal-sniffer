@@ -600,8 +600,14 @@ def analyze_flow(chunks: Sequence[StreamChunk]) -> FlowAnalysis:
 def group_chunks_by_flow(
     chunks: Sequence[StreamChunk],
 ) -> Dict[object, List[StreamChunk]]:
-    """Bucket chunks by connection, preserving capture order within each."""
+    """Bucket chunks by connection, preserving capture order within each.
+
+    Keyed on the device as well as the flow. A flow names the peer — the PC —
+    which is the same for every instrument being watched, so two devices
+    recorded into one file would otherwise have their traffic merged into a
+    single set of channels and analysed as one instrument.
+    """
     flows: Dict[object, List[StreamChunk]] = {}
     for chunk in chunks:
-        flows.setdefault(chunk.flow, []).append(chunk)
+        flows.setdefault((chunk.device_ip, chunk.flow), []).append(chunk)
     return flows
