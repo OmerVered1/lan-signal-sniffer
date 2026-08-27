@@ -27,9 +27,12 @@ mapping at all — and the answer may be no.
 
 from __future__ import annotations
 
+import csv
 import math
+import warnings
+import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -49,6 +52,10 @@ MIN_PAIRED_SAMPLES = 20
 # were not being sent. Beyond this the array search is the one that applies,
 # and `analyse` says so rather than letting the limit pass unmentioned.
 MAX_SCALAR_BYTES = 2048
+# Below this a capture cannot settle the question either way. Said out loud
+# because the last search of this kind ran on eighteen seconds and its empty
+# result was read as proof the values are never sent.
+MIN_USEFUL_SPAN_S = 300.0
 # How far a vendor reading may sit from a frame and still be paired with it.
 DEFAULT_TOLERANCE_S = 15.0
 # A band grows outwards from its peak while indices stay this good, relative to
@@ -186,6 +193,58 @@ def channels_from_chunks(chunks: Sequence[StreamChunk]) -> Dict[str, List[Tuple[
     return grouped
 
 
+def channels_from_survey(path: Path) -> Dict[str, List[Tuple[float, bytes]]]:
+    """Rebuild the same grouping from a survey CSV's hex columns.
+
+    *Record everything* writes three files and the `.raw.jsonl` is the one people
+    forget to keep, so accept the CSV as well. It carries the reply bytes and the
+    capture clock, which is all this search needs — but only the first
+    `MAX_HEX_BYTES` of each reply, marked with a trailing ellipsis. Truncated
+    rows are read as far as they go and counted, because a band search over
+    quietly shortened arrays would answer the wrong question.
+    """
+    grouped: Dict[str, List[Tuple[float, bytes]]] = {}
+    truncated = 0
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        columns = [c for c in (reader.fieldnames or []) if c.endswith(":hex")]
+        for row in reader:
+            stamp = (row.get("timestamp_utc") or "").strip()
+            if not stamp:
+                continue
+            try:
+                when = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S.%f")
+            except ValueError:
+                try:
+                    when = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+            ts = when.replace(tzinfo=timezone.utc).timestamp()
+            for column in columns:
+                text = (row.get(column) or "").strip()
+                if not text:
+                    continue
+                if text.endswith("..."):
+                    text = text[:-3]
+                    truncated += 1
+                try:
+                    payload = bytes.fromhex(text)
+                except ValueError:
+                    continue
+                grouped.setdefault(column[: -len(":hex")] + ":", []).append(
+                    (ts, payload)
+                )
+    if truncated:
+        # Not raised: the scalar search still works on a truncated reply, and
+        # refusing the file outright would help nobody.
+        print(
+            f"note: {truncated} replies were cut short in this CSV; "
+            "the .raw.jsonl holds them in full",
+            file=sys.stderr,
+        )
+    return grouped
+
+
 def build_array_channels(
     replies: Dict[str, List[Tuple[float, bytes]]],
     min_bytes: int = MIN_ARRAY_BYTES,
@@ -312,7 +371,12 @@ def _fit_holdout(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float, flo
     """
     n = len(x)
     cut = max(2, n // 2)
-    with np.errstate(invalid="ignore", over="ignore", divide="ignore"):
+    with np.errstate(invalid="ignore", over="ignore", divide="ignore"), \
+            warnings.catch_warnings():
+        # A degenerate window is an ordinary outcome of sweeping every offset,
+        # and it is caught two lines down. Reporting it as a warning would bury
+        # the answer under thousands of lines of it.
+        warnings.simplefilter("ignore")
         a, b = np.polyfit(x[:cut], y[:cut], 1)
     if not (np.isfinite(a) and np.isfinite(b)):
         return 0.0, 0.0, 0.0, 0.0
@@ -320,7 +384,10 @@ def _fit_holdout(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float, flo
     actual = y[cut:]
     if len(actual) < 2 or np.std(actual) == 0:
         return float(a), float(b), 0.0, 0.0
-    r = float(np.corrcoef(predicted, actual)[0, 1])
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r = float(np.corrcoef(predicted, actual)[0, 1])
+    if not np.isfinite(r):
+        return float(a), float(b), 0.0, 0.0
     ss_res = float(((actual - predicted) ** 2).sum())
     ss_tot = float(((actual - actual.mean()) ** 2).sum())
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
@@ -445,13 +512,30 @@ def analyse(
     vendor: Sequence[Tuple[datetime, Dict[str, str]]],
     columns: Sequence[str],
     tolerance_s: float = DEFAULT_TOLERANCE_S,
+    replies: Optional[Dict[str, List[Tuple[float, bytes]]]] = None,
 ) -> Report:
-    """Run both searches and report what, if anything, reproduces the values."""
+    """Run both searches and report what, if anything, reproduces the values.
+
+    `replies` is for the case where the grouping came from somewhere other than a
+    raw capture — a survey CSV, say. Passing it skips the framing step.
+    """
     report = Report()
-    replies = channels_from_chunks(chunks)
+    if replies is None:
+        replies = channels_from_chunks(chunks)
     if not replies:
         report.notes.append("no request/reply channels found in the capture")
         return report
+
+    stamps = [t for samples in replies.values() for t, _p in samples]
+    if stamps:
+        span = max(stamps) - min(stamps)
+        if span < MIN_USEFUL_SPAN_S:
+            report.notes.append(
+                f"the capture covers only {span:.0f} s. A channel polled every "
+                "few seconds contributes a handful of samples to that, and a "
+                "handful of samples correlates with almost anything. Record "
+                "the whole run before believing — or disbelieving — this result"
+            )
 
     report.arrays = build_array_channels(replies)
     if not report.arrays:

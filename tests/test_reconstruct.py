@@ -213,3 +213,31 @@ def test_a_text_column_in_the_export_does_not_stop_the_search():
         capture_with_scalar(), vendor, ["V1_I_18", "V1_Status"]
     )
     assert "V1_I_18" in report.solved
+
+
+# ----- working from what the user actually kept ------------------------------
+
+
+def test_the_search_works_from_a_survey_csv_too():
+    """Record everything writes three files; the .raw.jsonl is the forgotten one."""
+    from lan_sniffer.analysis.reconstruct import channels_from_survey
+    from lan_sniffer.writers.survey import build_survey, write_survey
+
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        csv_path = Path(tmp) / "survey.csv"
+        write_survey(build_survey(capture_with_scalar()), csv_path)
+        replies = channels_from_survey(csv_path)
+
+    assert replies, "the CSV's hex columns should rebuild the channels"
+    fits = find_scalars(replies, vendor_export(), ["V1_I_18"])
+    assert fits and fits[0].byte_offset == 8
+    assert fits[0].convincing, "the CSV route must reach the same answer"
+
+
+def test_a_capture_too_short_to_settle_the_question_says_so():
+    """An empty result from eighteen seconds is not evidence of absence."""
+    report = analyse(capture_with_scalar(n=25), vendor_export(n=25), ["V1_I_18"])
+    assert any("covers only" in note for note in report.notes), report.notes

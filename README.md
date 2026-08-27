@@ -222,6 +222,8 @@ and the vendor software's own export of the same period:
 python tools/find_values.py session.raw.jsonl questor.csv
 ```
 
+The survey CSV works in place of the `.raw.jsonl` if that is what you kept.
+
 For every column in the export it sweeps every byte offset and every encoding of
 every channel, and every index of any array-shaped reply, looking for something
 whose *shape over time* tracks the published column. It then fits a scale and
@@ -320,7 +322,7 @@ rediscovers the C80's channels on its own.
 python -m pytest tests/ -q
 ```
 
-250 tests, no hardware and no capture driver needed — the decoding engine is pure
+252 tests, no hardware and no capture driver needed — the decoding engine is pure
 functions over byte streams. Synthetic fixtures cover all four protocol shapes
 (C80-style fixed binary, Modbus/TCP with a transaction counter, SCPI text, and an
 unprompted stream), and are built by pushing real segments through the real

@@ -25,14 +25,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from lan_sniffer.analysis.reconstruct import analyse  # noqa: E402
+from lan_sniffer.analysis.reconstruct import analyse, channels_from_survey  # noqa: E402
 from lan_sniffer.writers.merge import load_export  # noqa: E402
 from lan_sniffer.writers.raw_writer import read_raw  # noqa: E402
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("capture", help="a .raw.jsonl recorded by the sniffer")
+    parser.add_argument(
+        "capture",
+        help="a .raw.jsonl, or the survey CSV from Record everything",
+    )
     parser.add_argument("export", help="the vendor software's own CSV export")
     parser.add_argument(
         "--tz-offset", type=float, default=0.0,
@@ -45,8 +48,16 @@ def main() -> int:
     parser.add_argument("--column", action="append", help="limit to one column")
     args = parser.parse_args()
 
-    chunks = list(read_raw(Path(args.capture)))
-    print(f"capture: {len(chunks)} chunks")
+    source = Path(args.capture)
+    if source.name.endswith(".raw.jsonl"):
+        chunks = list(read_raw(source))
+        replies = None
+        print(f"capture: {len(chunks)} chunks")
+    else:
+        chunks = []
+        replies = channels_from_survey(source)
+        total = sum(len(v) for v in replies.values())
+        print(f"capture: {len(replies)} channels, {total} replies (from the CSV)")
     columns, samples = load_export(Path(args.export), args.tz_offset)
     wanted = args.column or columns
     print(f"export : {len(samples)} rows, columns {', '.join(columns)}")
@@ -54,7 +65,9 @@ def main() -> int:
         print(f"         {samples[0][0]} to {samples[-1][0]}")
     print()
 
-    report = analyse(chunks, samples, wanted, tolerance_s=args.tolerance)
+    report = analyse(
+        chunks, samples, wanted, tolerance_s=args.tolerance, replies=replies
+    )
     for note in report.notes:
         print(f"  note: {note}")
     if report.notes:
@@ -65,7 +78,10 @@ def main() -> int:
     for fit in report.scalars + report.bands:
         mark = "FOUND   " if fit.convincing else "weak    "
         print(f"  {mark}{fit.describe()}")
-        print(f"          held-out r={fit.r_holdout:+.4f} r2={fit.r2_holdout:.4f} "
+        # A wildly negative r2 means the fitted line misses the held-out half
+        # by orders of magnitude; the exact figure carries nothing further.
+        r2 = f"{fit.r2_holdout:.4f}" if fit.r2_holdout > -10 else "far below zero"
+        print(f"          held-out r={fit.r_holdout:+.4f} r2={r2} "
               f"over {fit.samples} paired samples")
     if not (report.scalars or report.bands):
         print("  nothing in the capture tracked any of the columns.")
