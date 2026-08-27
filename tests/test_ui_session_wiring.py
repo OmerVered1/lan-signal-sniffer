@@ -414,3 +414,59 @@ def test_both_controlling_devices_must_stop_before_the_file_closes(window):
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ----- recording an instrument nobody has decoded yet ------------------------
+
+
+def test_a_device_with_no_profile_can_still_be_recorded(qapp, tmp_path, monkeypatch):
+    """The raw sidecar exists precisely for the undecoded case.
+
+    Requiring a profile to press Start meant the one situation the raw file was
+    built for was the one situation it could not be produced in — while the
+    panel said to start recording by hand.
+    """
+    from lan_sniffer.ui import main_window as mw
+
+    monkeypatch.setattr(mw, "PROFILE_DIR", tmp_path / "profiles")
+    w = mw.MainWindow()
+    w._output_dir = tmp_path / "sessions"
+    w._device_forms[0].set_label("spectrometer")
+    w._device_forms[0].set_address("172.16.0.1")
+    w._device_forms[0].save()
+    arm(w)
+    w._update_controls()
+
+    assert w._start_btn.isEnabled(), "Start must not depend on having a profile"
+
+    w._open_session(manual=True)
+    assert w._csv is not None, "a session should have opened"
+    feed(w, [(float(t), IDLE_REQ, b"\x01\x02\x03\x04") for t in range(5)])
+    w._close_session(manual=True)
+    w.close()
+
+    raw = list((tmp_path / "sessions").glob("*.raw.jsonl"))
+    assert raw, "the traffic must be on disk even with nothing named"
+    assert raw[0].stat().st_size > 0
+
+
+def test_the_banner_does_not_read_as_a_failed_recording(qapp, tmp_path, monkeypatch):
+    """With no signals named there are no rows, and '0 rows' looks broken."""
+    from lan_sniffer.ui import main_window as mw
+
+    monkeypatch.setattr(mw, "PROFILE_DIR", tmp_path / "profiles")
+    w = mw.MainWindow()
+    w._output_dir = tmp_path / "sessions"
+    w._device_forms[0].set_address("172.16.0.1")
+    w._device_forms[0].save()
+    arm(w)
+    w._open_session(manual=True)
+    feed(w, [(float(t), IDLE_REQ, b"\x01\x02\x03\x04") for t in range(5)])
+    w._update_session_label()
+    text = w._banner.text()
+    w._close_session(manual=True)
+    w.close()
+
+    assert "RECORDING" in text
+    assert "raw only" in text
+    assert "0 rows" not in text

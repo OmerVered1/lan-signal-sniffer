@@ -945,21 +945,18 @@ class MainWindow(QMainWindow):
         if self._csv is not None:
             return
         configured = [m for m in self._monitors if m.profile is not None]
-        if not configured:
-            QMessageBox.warning(
-                self,
-                "No profile",
-                "Recording needs a profile so the columns have names and units. "
-                "Identify the device's signals first.",
-            )
-            return
-
+        # A session with no profile at all is still worth recording. The raw
+        # sidecar holds every byte either way, and that is exactly what an
+        # instrument nobody has decoded yet needs — refusing to record it meant
+        # the one case the raw file exists for was the one case it was denied.
+        # The CSV then has no signal columns, and the banner says so.
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        stem = (
-            _slug(configured[0].profile.name)
-            if len(configured) == 1
-            else "_".join(_slug(m.name) for m in configured)
-        )
+        if len(configured) == 1:
+            stem = _slug(configured[0].profile.name)
+        elif configured:
+            stem = "_".join(_slug(m.name) for m in configured)
+        else:
+            stem = "_".join(_slug(m.name) for m in self._monitors) or "capture"
         base = _unclaimed(self._output_dir / f"{stem}_{stamp}")
         names: List[str] = []
         units: Dict[str, str] = {}
@@ -1000,7 +997,14 @@ class MainWindow(QMainWindow):
                 if monitor.detector is not None:
                     monitor.detector.start(time.time())
                     monitor.running = True
-        self.statusBar().showMessage(f"Recording to {base.name}.csv", 8000)
+        if names:
+            self.statusBar().showMessage(f"Recording to {base.name}.csv", 8000)
+        else:
+            self.statusBar().showMessage(
+                f"Recording raw traffic to {base.name}.raw.jsonl — no signals "
+                "are named, so the CSV will have no data columns.",
+                12000,
+            )
         self._update_controls()
 
     def _close_session(self, manual: bool = False) -> None:
@@ -1010,9 +1014,16 @@ class MainWindow(QMainWindow):
                 self._csv.add(tail.ts, tail.values)
         if self._csv is not None:
             rows = self._csv.rows_written
+            named = bool(self._csv.signal_names)
+            chunks = self._raw.chunks_written if self._raw is not None else 0
             self._live.mark_session(time.time(), "stop")
             self._csv.close()
-            self.statusBar().showMessage(f"Session closed — {rows} row(s).", 8000)
+            closed = (
+                f"Session closed — {rows} row(s)."
+                if named
+                else f"Session closed — {chunks} chunk(s) of raw traffic."
+            )
+            self.statusBar().showMessage(closed, 8000)
         self._csv = None
         if self._raw is not None:
             self._raw.close()
@@ -1059,17 +1070,25 @@ class MainWindow(QMainWindow):
                 if len(self._monitors) > 1
                 else ""
             )
+            if self._csv.signal_names:
+                what = f"{self._csv.rows_written} rows"
+            else:
+                # No profile anywhere, so there is nothing to put in a column.
+                # Reporting "0 rows" would read as a recording going wrong.
+                chunks = self._raw.chunks_written if self._raw is not None else 0
+                what = f"{chunks} chunks · raw only"
             self._banner.setText(
                 f"⏺  RECORDING   {elapsed // 60:d}:{elapsed % 60:02d}   ·   "
-                f"{self._csv.rows_written} rows{across}"
+                f"{what}{across}"
             )
             self._banner.setStyleSheet(
                 "background:#1a7f37; color:white; font-weight:bold; "
                 "font-size:15px; padding:9px; border-radius:4px;"
             )
-            self._session_label.setText(
-                f"Writing to <code>{Path(self._csv.path).name}</code>"
-            )
+            target = Path(self._csv.path).name
+            if not self._csv.signal_names:
+                target = target[:-4] + ".raw.jsonl" if target.endswith(".csv") else target
+            self._session_label.setText(f"Writing to <code>{target}</code>")
             return
 
         # With several devices the panel reports the one still waiting, since
@@ -1139,8 +1158,7 @@ class MainWindow(QMainWindow):
             form.set_enabled_for_capture(capturing, removable)
         self._add_device_btn.setEnabled(not capturing)
 
-        has_profile = any(m.profile is not None for m in self._monitors)
-        self._start_btn.setEnabled(capturing and not recording and has_profile)
+        self._start_btn.setEnabled(capturing and not recording)
         self._stop_btn.setEnabled(recording)
         self._split_btn.setEnabled(recording)
         self._capture_btn.setText("Stop capture" if capturing else "Start capture")
