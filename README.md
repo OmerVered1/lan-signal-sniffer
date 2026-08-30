@@ -256,6 +256,43 @@ A capture minutes long is worth far more than one seconds long here: a channel
 that publishes every 8 seconds contributes two samples to a 20-second capture,
 and nothing can be identified from two samples.
 
+## Asking an instrument directly
+
+`tools/probe_analyser.py` is the one thing here that transmits, and it exists
+for the case where watching cannot work.
+
+The MAX300 is that case. Four hours of its traffic, 58 channels, every offset
+and encoding: nothing decodes into the ion-current range, and its two large
+arrays correlate at **0.26 and −0.00 between sweeps 2.6 seconds apart**, so they
+are detector noise rather than a repeatable spectrum. Questor computes the
+published values and writes them to a file. No amount of sniffing that link
+produces them — but nobody had asked the analyser itself.
+
+```bash
+python tools/probe_analyser.py list session.raw.jsonl --device 172.16.0.1
+```
+
+`list` touches no network. `replay` sends each observed request once and shows
+what comes back; `sweep` varies a single 32-bit field of one observed request
+through an address range, which is how you find out whether the instrument holds
+something its own software never asks for.
+
+Three rules keep it honest:
+
+* **Nothing is invented.** Every request sent is one the capture recorded, or
+  one of those with a single field changed. The app never guesses at an opcode
+  it has not seen the instrument accept.
+* **Reads only, by evidence.** A request the vendor software repeated for hours
+  is a poll. One sent once, at startup, may be a write, and is excluded unless
+  named explicitly.
+* **It refuses to open a socket** until you pass `--vendor-software-is-closed`.
+  These instruments accept a single TCP client, and taking it from software
+  that is mid-measurement is the thing this whole app was built to avoid.
+
+That last rule is the trade being made. Passive capture is safe because it
+cannot affect the instrument; this can, and is worth it only when the vendor
+software is not running and there is no experiment to interrupt.
+
 ## When the instrument never sends the numbers
 
 Sometimes the search comes back empty because the numbers were never on the
