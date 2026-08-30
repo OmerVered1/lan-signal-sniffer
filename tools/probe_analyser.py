@@ -33,6 +33,7 @@ are excluded by default, because a command that is not repeated may be a write.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -51,8 +52,26 @@ CONFIRM = "--vendor-software-is-closed"
 
 
 def load(args) -> list:
-    chunks = list(read_raw(Path(args.capture)))
-    found = observed_requests(chunks, args.device or "")
+    """The requests to work from: a capture, or a list saved from one.
+
+    The capture that recorded these can be gigabytes and lives wherever the
+    analysis was done, which is rarely the machine plugged into the instrument.
+    `list --save` writes the few kilobytes that actually matter so they can be
+    carried across.
+    """
+    source = Path(args.capture)
+    if source.suffix == ".json":
+        saved = json.loads(source.read_text(encoding="utf-8"))
+        found = [
+            ObservedRequest(
+                payload=bytes.fromhex(entry["request"]),
+                count=int(entry["count"]),
+                reply_sizes={int(k): int(v) for k, v in entry["reply_sizes"].items()},
+            )
+            for entry in saved["requests"]
+        ]
+    else:
+        found = observed_requests(list(read_raw(source)), args.device or "")
     if not args.include_one_offs:
         found = [r for r in found if r.is_poll]
     return found
@@ -68,6 +87,29 @@ def summarise(reply: bytes) -> str:
 
 def cmd_list(args) -> int:
     found = load(args)
+    if args.save:
+        Path(args.save).write_text(
+            json.dumps(
+                {
+                    "source": Path(args.capture).name,
+                    "device": args.device or "",
+                    "requests": [
+                        {
+                            "request": r.payload.hex(),
+                            "count": r.count,
+                            "reply_sizes": {str(k): v for k, v in r.reply_sizes.items()},
+                        }
+                        for r in found
+                    ],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(f"saved {len(found)} request(s) to {args.save}\n"
+              f"Copy that file to the machine wired to the instrument and use "
+              f"it in place of the capture.\n")
     print(f"{len(found)} distinct request(s) in {Path(args.capture).name}\n")
     by_opcode = {}
     for request in found:
@@ -170,7 +212,10 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     def common(p, network: bool):
-        p.add_argument("capture", help="a .raw.jsonl recorded from this instrument")
+        p.add_argument(
+            "capture",
+            help="a .raw.jsonl from this instrument, or a .json saved by `list --save`",
+        )
         if network:
             p.add_argument("host")
             p.add_argument("port", type=int)
@@ -183,7 +228,9 @@ def main() -> int:
         p.add_argument("--include-one-offs", action="store_true",
                        help="also use requests sent only once — these may be writes")
 
-    common(sub.add_parser("list", help="show the requests, without connecting"), False)
+    listing = sub.add_parser("list", help="show the requests, without connecting")
+    common(listing, False)
+    listing.add_argument("--save", help="write them to a small JSON to carry along")
     common(sub.add_parser("replay", help="send each observed request once"), True)
     sweep = sub.add_parser("sweep", help="vary one field of one observed request")
     common(sweep, True)

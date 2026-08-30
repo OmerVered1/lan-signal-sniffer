@@ -272,6 +272,11 @@ produces them — but nobody had asked the analyser itself.
 python tools/probe_analyser.py list session.raw.jsonl --device 172.16.0.1
 ```
 
+The capture that recorded these is often gigabytes and rarely lives on the
+machine wired to the instrument, so `list --save requests.json` writes the few
+kilobytes that matter and every command accepts that file in place of the
+capture. `probe_lists/max300_requests.json` is the MAX300's, already extracted.
+
 `list` touches no network. `replay` sends each observed request once and shows
 what comes back; `sweep` varies a single 32-bit field of one observed request
 through an address range, which is how you find out whether the instrument holds
