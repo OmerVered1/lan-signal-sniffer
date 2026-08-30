@@ -26,6 +26,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lan_sniffer.analysis.reconstruct import analyse, channels_from_survey  # noqa: E402
+from lan_sniffer.analysis.vendor import (  # noqa: E402
+    constant_columns,
+    load_calisto,
+    load_questor,
+    local_offset_hours,
+)
 from lan_sniffer.writers.merge import load_export  # noqa: E402
 from lan_sniffer.writers.raw_writer import read_raw  # noqa: E402
 
@@ -39,13 +45,26 @@ def main() -> int:
     parser.add_argument("export", help="the vendor software's own CSV export")
     parser.add_argument(
         "--tz-offset", type=float, default=0.0,
-        help="hours to subtract from the export's stamps if its clock is local",
+        help="hours to subtract from the export's stamps if its clock is local. "
+             "Derive it rather than guess: pass --derive-tz instead",
+    )
+    parser.add_argument(
+        "--derive-tz", action="store_true",
+        help="work the offset out from the session filename and its first record",
+    )
+    parser.add_argument(
+        "--format", choices=("auto", "questor", "calisto", "generic"),
+        default="auto", help="how to read the export",
     )
     parser.add_argument(
         "--tolerance", type=float, default=15.0,
         help="seconds a reading may sit from a frame and still be paired",
     )
     parser.add_argument("--column", action="append", help="limit to one column")
+    parser.add_argument(
+        "--top", type=int, default=1,
+        help="show this many readings per column, best fit first",
+    )
     parser.add_argument(
         "--device",
         help="with two instruments in one capture, search only this one (by IP)",
@@ -70,7 +89,33 @@ def main() -> int:
             print(f"no traffic in this capture came from {args.device}")
             return 1
 
-    columns, samples = load_export(Path(args.export), args.tz_offset)
+    tz = args.tz_offset
+    if args.derive_tz:
+        with open(args.capture, "rb") as handle:
+            handle.readline()
+            first = float(handle.readline().split(b'"ts": ')[1].split(b",")[0])
+        tz = local_offset_hours(source.name, first)
+        print(f"clock offset derived from the session name: {tz:+g} h")
+
+    kind = args.format
+    if kind == "auto":
+        head = Path(args.export).read_bytes()[:400]
+        if b"Time Relative" in head or b"Sourcefile" in head:
+            kind = "questor"
+        elif b"Zone Start Time" in head or head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            kind = "calisto"
+        else:
+            kind = "generic"
+    reader = {"questor": load_questor, "calisto": load_calisto, "generic": load_export}[kind]
+    columns, samples = reader(Path(args.export), tz)
+    print(f"export read as: {kind}")
+
+    flat = constant_columns(samples, columns)
+    if flat:
+        # Not a failure of the search, and easily mistaken for one.
+        print("flat over this export (nothing can identify these): "
+              + ", ".join(flat))
+    columns = [c for c in columns if c not in flat]
     wanted = args.column or columns
     print(f"export : {len(samples)} rows, columns {', '.join(columns)}")
     if samples:
@@ -78,14 +123,15 @@ def main() -> int:
     print()
 
     report = analyse(
-        chunks, samples, wanted, tolerance_s=args.tolerance, replies=replies
+        chunks, samples, wanted, tolerance_s=args.tolerance, replies=replies,
+        top=args.top,
     )
     for note in report.notes:
         print(f"  note: {note}")
     if report.notes:
         print()
 
-    print(f"{len(report.arrays)} array view(s) considered")
+    print(f"{report.array_views} array view(s) considered")
     print()
     for fit in report.scalars + report.bands:
         mark = "FOUND   " if fit.convincing else "weak    "
@@ -93,8 +139,12 @@ def main() -> int:
         # A wildly negative r2 means the fitted line misses the held-out half
         # by orders of magnitude; the exact figure carries nothing further.
         r2 = f"{fit.r2_holdout:.4f}" if fit.r2_holdout > -10 else "far below zero"
-        print(f"          held-out r={fit.r_holdout:+.4f} r2={r2} "
-              f"over {fit.samples} paired samples")
+        line = (f"          held-out r={fit.r_holdout:+.4f} r2={r2} "
+                f"over {fit.samples} paired samples")
+        raw_min = getattr(fit, "raw_min", None)
+        if raw_min is not None and getattr(fit, "raw_max", 0) != raw_min:
+            line += f"   ·   raw {raw_min:.6g} .. {fit.raw_max:.6g}"
+        print(line)
     if not (report.scalars or report.bands):
         print("  nothing in the capture tracked any of the columns.")
     print()

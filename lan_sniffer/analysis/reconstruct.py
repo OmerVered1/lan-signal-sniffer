@@ -34,7 +34,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -56,6 +56,9 @@ MAX_SCALAR_BYTES = 2048
 # because the last search of this kind ran on eighteen seconds and its empty
 # result was read as proof the values are never sent.
 MIN_USEFUL_SPAN_S = 300.0
+# A magnitude past which a decoded series is a misread, not a reading. Set well
+# above any instrument's range and well below where squaring a double overflows.
+ABSURD = 1e30
 # How far a vendor reading may sit from a frame and still be paired with it.
 DEFAULT_TOLERANCE_S = 15.0
 # A band grows outwards from its peak while indices stay this good, relative to
@@ -72,6 +75,13 @@ ELEMENTS: Tuple[Tuple[str, str, int], ...] = (
     ("i32le", "<i4", 4),
     ("f32le", "<f4", 4),
     ("f32be", ">f4", 4),
+    # Doubles were missing here, and their absence did not look like an
+    # absence: a f64 read as the f32 sitting in its top half still rises and
+    # falls with the real value, so it correlates at r = 1.000 while no scale
+    # and offset can reproduce it. A perfect correlation with a hopeless fit is
+    # that mistake, not a near miss.
+    ("f64le", "<f8", 8),
+    ("f64be", ">f8", 8),
 )
 
 
@@ -147,21 +157,37 @@ class ScalarFit:
     r_holdout: float
     r2_holdout: float
     samples: int
+    raw_min: float = 0.0
+    raw_max: float = 0.0
 
     @property
     def convincing(self) -> bool:
         return abs(self.r_holdout) >= 0.9 and self.r2_holdout >= 0.8
 
+    @property
+    def near_identity(self) -> bool:
+        """Whether the field is already in the unit the software displays.
+
+        A directly transmitted reading needs no scaling; one that needs a large
+        factor is more likely a different quantity that happens to move with
+        this one. Weak evidence on its own — a genuine reading can be held in
+        counts — but decisive when two columns claim the same field and only
+        one of them fits it without stretching.
+        """
+        return abs(self.scale - 1.0) < 0.02 and abs(self.bias) < 1.0
+
     def describe(self) -> str:
         return (
             f"{self.vendor_column}: {self.channel} byte {self.byte_offset} "
             f"as {self.element}, value = {self.scale:.6g} x raw + {self.bias:.6g}"
+            + ("  [already in the displayed unit]" if self.near_identity else "")
         )
 
 
 @dataclass
 class Report:
     arrays: List[ArrayChannel] = field(default_factory=list)
+    array_views: int = 0
     bands: List[BandFit] = field(default_factory=list)
     scalars: List[ScalarFit] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
@@ -197,6 +223,30 @@ def channels_from_chunks(chunks: Sequence[StreamChunk]) -> Dict[str, List[Tuple[
             for ts, payload in zip(channel.timestamps, channel.payloads):
                 grouped[key].append((ts, payload))
     return grouped
+
+
+def _length_groups(
+    samples: Sequence[Tuple[float, bytes]], minimum: int = MIN_PAIRED_SAMPLES
+) -> List[Tuple[int, List[Tuple[float, bytes]]]]:
+    """Split a channel's replies by length, keeping every length worth reading.
+
+    Taking the most common length and discarding the rest is wrong for a very
+    ordinary shape: an instrument that answers "nothing new" with a short ack
+    and sends a full frame only when something changed. Its acks outnumber its
+    data, so the modal length *is* the ack, and the real frames — the only ones
+    carrying readings — were the ones being thrown away.
+
+    Lengths still have to be kept apart from each other, because a field lives
+    at a fixed offset within a frame of a given shape and offsets do not carry
+    across shapes.
+    """
+    by_length: Dict[int, List[Tuple[float, bytes]]] = {}
+    for ts, payload in samples:
+        by_length.setdefault(len(payload), []).append((ts, payload))
+    return sorted(
+        ((n, rows) for n, rows in by_length.items() if n and len(rows) >= minimum),
+        key=lambda item: -len(item[1]),
+    )
 
 
 def channels_from_survey(path: Path) -> Dict[str, List[Tuple[float, bytes]]]:
@@ -255,45 +305,57 @@ def build_array_channels(
     replies: Dict[str, List[Tuple[float, bytes]]],
     min_bytes: int = MIN_ARRAY_BYTES,
 ) -> List[ArrayChannel]:
+    """Every array view at once. Convenient, and only safe on a short capture.
+
+    A 24 KB reply read as 32-bit words is six thousand columns, so four hours of
+    one instrument is a quarter-gigabyte per view and there are dozens of views.
+    `iter_array_channels` yields the same things one at a time and is what the
+    search uses; this stays for callers that genuinely want them all.
+    """
+    return list(iter_array_channels(replies, min_bytes))
+
+
+def iter_array_channels(
+    replies: Dict[str, List[Tuple[float, bytes]]],
+    min_bytes: int = MIN_ARRAY_BYTES,
+) -> Iterator["ArrayChannel"]:
     """Read every large channel as a table of samples against index.
 
     Each element type and byte alignment is offered separately rather than
     guessed at: picking wrongly would hide the band, and correlation costs
     little enough to try them all.
     """
-    out: List[ArrayChannel] = []
     for key, samples in replies.items():
-        if len(samples) < MIN_PAIRED_SAMPLES:
-            continue
-        lengths = {len(p) for _t, p in samples}
-        modal = max(lengths, key=lambda n: sum(1 for _t, p in samples if len(p) == n))
-        if modal < min_bytes:
-            continue
-        kept = [(t, p) for t, p in samples if len(p) == modal]
-        raw = b"".join(p for _t, p in kept)
-        times = [datetime.utcfromtimestamp(t) for t, _p in kept]
-        channel, _, signature = key.partition(":")
+        groups = _length_groups(samples)
+        for modal, kept in groups:
+            if modal < min_bytes:
+                continue
+            raw = b"".join(p for _t, p in kept)
+            times = [datetime.utcfromtimestamp(t) for t, _p in kept]
+            channel = key if len(groups) == 1 else f"{key}/{modal}B"
+            signature = key.partition(":")[2]
 
-        for name, dtype, size in ELEMENTS:
-            for offset in range(0, size):
-                count = (modal - offset) // size
-                if count < 16:
-                    continue
-                # Reading at the wrong alignment produces infinities, which
-                # numpy warns about on the way to float64. That is expected
-                # here — the whole method is to try every alignment and let
-                # correlation reject the nonsense — so the warning is silenced
-                # rather than allowed to stop the sweep.
-                with np.errstate(invalid="ignore", over="ignore"):
-                    block = np.frombuffer(
-                        b"".join(p[offset : offset + count * size] for _t, p in kept),
-                        dtype=dtype,
-                    ).astype(np.float64)
-                matrix = block.reshape(len(kept), count)
-                if not np.all(np.isfinite(matrix)):
-                    continue
-                out.append(
-                    ArrayChannel(
+            for name, dtype, size in ELEMENTS:
+                for offset in range(0, size):
+                    count = (modal - offset) // size
+                    if count < 16:
+                        continue
+                    # Reading at the wrong alignment produces infinities, which
+                    # numpy warns about on the way to float64. That is expected
+                    # here — the whole method is to try every alignment and let
+                    # correlation reject the nonsense — so the warning is
+                    # silenced rather than allowed to stop the sweep.
+                    with np.errstate(invalid="ignore", over="ignore"):
+                        block = np.frombuffer(
+                            b"".join(
+                                p[offset : offset + count * size] for _t, p in kept
+                            ),
+                            dtype=dtype,
+                        ).astype(np.float64)
+                    matrix = block.reshape(len(kept), count)
+                    if not np.all(np.isfinite(matrix)):
+                        continue
+                    yield ArrayChannel(
                         channel=channel,
                         signature=signature,
                         element=name,
@@ -301,8 +363,6 @@ def build_array_channels(
                         values=matrix,
                         times=times,
                     )
-                )
-    return out
 
 
 # ----- pairing against the vendor export ------------------------------------
@@ -369,6 +429,24 @@ def _grow_band(r: np.ndarray, peak: int, floor: float) -> Tuple[int, int]:
     return start, end
 
 
+def _usable(values: np.ndarray) -> bool:
+    """Whether a decoded series is worth correlating at all.
+
+    Finite is not enough. A float read at the wrong alignment lands anywhere in
+    the double range, and a series around 1e300 overflows on the way to its own
+    variance — so the magnitude is rejected before anything is computed from
+    it. No instrument reports 1e30 of anything.
+    """
+    if values.size == 0:
+        return False
+    with np.errstate(invalid="ignore", over="ignore"):
+        largest = float(np.max(np.abs(values)))
+    if not np.isfinite(largest) or largest > ABSURD:
+        return False
+    with np.errstate(invalid="ignore", over="ignore"):
+        return bool(np.std(values) > 0)
+
+
 def _fit_holdout(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float, float]:
     """Fit y = a x + b on the first half, score on the second.
 
@@ -401,16 +479,22 @@ def _fit_holdout(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float, flo
 
 
 def find_bands(
-    arrays: Sequence[ArrayChannel],
+    arrays: Iterable[ArrayChannel],
     vendor: Sequence[Tuple[datetime, Dict[str, str]]],
     columns: Sequence[str],
     tolerance_s: float = DEFAULT_TOLERANCE_S,
 ) -> List[BandFit]:
-    """Look for a stretch of array indices that tracks each vendor column."""
-    fits: List[BandFit] = []
-    for column in columns:
-        best: Optional[BandFit] = None
-        for array in arrays:
+    """Look for a stretch of array indices that tracks each vendor column.
+
+    Iterates views on the outside and columns on the inside, which is the
+    opposite of the obvious order and the reason this can run at all: a view is
+    hundreds of megabytes, so it is built once, compared against every column,
+    and dropped before the next one is built.
+    """
+    best_for: Dict[str, BandFit] = {}
+    for array in arrays:
+        for column in columns:
+            best = best_for.get(column)
             rows, target = pair_with_vendor(array.times, vendor, column, tolerance_s)
             if len(rows) < MIN_PAIRED_SAMPLES or np.std(target) == 0:
                 continue
@@ -443,11 +527,18 @@ def find_bands(
                     r2_holdout=r2_out,
                     samples=len(rows),
                 )
-                if best is None or abs(candidate.r_holdout) > abs(best.r_holdout):
-                    best = candidate
-        if best is not None:
-            fits.append(best)
-    return fits
+                if best is None or _band_rank(candidate) > _band_rank(best):
+                    best = best_for[column] = candidate
+    return [best_for[c] for c in columns if c in best_for]
+
+
+def _band_rank(fit: BandFit) -> Tuple[float, float]:
+    """Rank on the held-out fit, then the correlation.
+
+    A band of the wrong width tracks the real one almost perfectly and
+    reproduces it not at all, so correlation alone puts the near-miss first.
+    """
+    return (round(fit.r2_holdout, 4), abs(fit.r_holdout))
 
 
 def find_scalars(
@@ -456,6 +547,7 @@ def find_scalars(
     columns: Sequence[str],
     max_bytes: int = MAX_SCALAR_BYTES,
     tolerance_s: float = DEFAULT_TOLERANCE_S,
+    top: int = 1,
 ) -> List[ScalarFit]:
     """Look for a plain field that tracks each vendor column.
 
@@ -466,17 +558,19 @@ def find_scalars(
     fits: List[ScalarFit] = []
     prepared = []
     for key, samples in replies.items():
-        if len(samples) < MIN_PAIRED_SAMPLES:
-            continue
-        lengths = {len(p) for _t, p in samples}
-        modal = max(lengths, key=lambda n: sum(1 for _t, p in samples if len(p) == n))
-        kept = [(t, p) for t, p in samples if len(p) == modal]
-        channel = key.partition(":")[0]
-        times = [datetime.utcfromtimestamp(t) for t, _p in kept]
-        prepared.append((channel, times, kept, min(modal, max_bytes)))
+        groups = _length_groups(samples)
+        for modal, kept in groups:
+            # The whole key, not just "chN": channel numbering restarts per
+            # slice, so an index identifies nothing outside the one run that
+            # produced it. The request signature is what a profile is written
+            # against. The length is part of the identity too when a channel
+            # answers in more than one shape.
+            label = key if len(groups) == 1 else f"{key}/{modal}B"
+            times = [datetime.utcfromtimestamp(t) for t, _p in kept]
+            prepared.append((label, times, kept, min(modal, max_bytes)))
 
     for column in columns:
-        best: Optional[ScalarFit] = None
+        found: List[ScalarFit] = []
         for channel, times, kept, width in prepared:
             rows, target = pair_with_vendor(times, vendor, column, tolerance_s)
             if len(rows) < MIN_PAIRED_SAMPLES or np.std(target) == 0:
@@ -488,7 +582,7 @@ def find_scalars(
                             b"".join(p[offset : offset + size] for _t, p in kept),
                             dtype=dtype,
                         ).astype(np.float64)[rows]
-                    if not np.all(np.isfinite(block)) or np.std(block) == 0:
+                    if not np.all(np.isfinite(block)) or not _usable(block):
                         continue
                     with np.errstate(invalid="ignore", divide="ignore"):
                         r = float(np.corrcoef(block, target)[0, 1])
@@ -505,12 +599,32 @@ def find_scalars(
                         r_holdout=r_out,
                         r2_holdout=r2_out,
                         samples=len(rows),
+                        raw_min=float(block.min()),
+                        raw_max=float(block.max()),
                     )
-                    if best is None or abs(candidate.r_holdout) > abs(best.r_holdout):
-                        best = candidate
-        if best is not None:
-            fits.append(best)
+                    found.append(candidate)
+        fits.extend(_pick(found, top))
     return fits
+
+
+def _pick(found: List[ScalarFit], top: int) -> List[ScalarFit]:
+    """Keep the best readings for one column, one per channel and offset.
+
+    Ranked on the held-out fit rather than the correlation: a reading of the
+    wrong width tracks the real one perfectly and reproduces it not at all, so
+    correlation alone puts the near-miss first.
+    """
+    best_at: Dict[Tuple[str, int], ScalarFit] = {}
+    for fit in found:
+        key = (fit.channel, fit.byte_offset)
+        current = best_at.get(key)
+        if current is None or _rank(fit) > _rank(current):
+            best_at[key] = fit
+    return sorted(best_at.values(), key=_rank, reverse=True)[:top]
+
+
+def _rank(fit: ScalarFit) -> Tuple[float, float]:
+    return (round(fit.r2_holdout, 4), abs(fit.r_holdout))
 
 
 def analyse(
@@ -519,6 +633,7 @@ def analyse(
     columns: Sequence[str],
     tolerance_s: float = DEFAULT_TOLERANCE_S,
     replies: Optional[Dict[str, List[Tuple[float, bytes]]]] = None,
+    top: int = 1,
 ) -> Report:
     """Run both searches and report what, if anything, reproduces the values.
 
@@ -543,8 +658,20 @@ def analyse(
                 "the whole run before believing — or disbelieving — this result"
             )
 
-    report.arrays = build_array_channels(replies)
-    if not report.arrays:
+    views = 0
+
+    def _views() -> Iterator[ArrayChannel]:
+        nonlocal views
+        for array in iter_array_channels(replies):
+            views += 1
+            yield array
+
+    have_arrays = any(
+        modal >= MIN_ARRAY_BYTES
+        for samples in replies.values()
+        for modal, _rows in _length_groups(samples)
+    )
+    if not have_arrays:
         report.notes.append(
             f"no channel had {MIN_PAIRED_SAMPLES}+ replies of at least "
             f"{MIN_ARRAY_BYTES} bytes; only the scalar search can apply"
@@ -564,8 +691,11 @@ def analyse(
             "the rest is searched as arrays"
         )
 
-    report.scalars = find_scalars(replies, vendor, columns, tolerance_s=tolerance_s)
-    report.bands = find_bands(report.arrays, vendor, columns, tolerance_s=tolerance_s)
+    report.scalars = find_scalars(
+        replies, vendor, columns, tolerance_s=tolerance_s, top=top
+    )
+    report.bands = find_bands(_views(), vendor, columns, tolerance_s=tolerance_s)
+    report.array_views = views
 
     for column in columns:
         varied = []

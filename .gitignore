@@ -24,3 +24,11 @@ installer_out/
 # OS
 .DS_Store
 Thumbs.db
+
+# Experiment data copied in for analysis: captures, vendor exports, archives.
+# This repository is public and these are unpublished measurements, so the
+# ignore is deliberately broad — a data file added here should never be one
+# `git add -A` can pick up.
+results for sniffer calb/
+*.7z
+*.zip
