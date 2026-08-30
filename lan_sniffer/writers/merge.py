@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,6 +38,8 @@ TIMESTAMP_FORMATS = (
     "%m/%d/%Y %H:%M:%S",
     "%d/%m/%Y %H:%M:%S",
 )
+
+from ..analysis.vendor import load_calisto, load_questor
 
 # How far a vendor sample may sit from a session row and still be used. A
 # process analyser reporting every 8 s should not have a reading stretched
@@ -132,7 +136,20 @@ def _timestamp_column(header: Sequence[str], rows: Sequence[Sequence[str]]) -> i
 def load_export(
     path: Path, tz_offset_hours: float = 0.0
 ) -> Tuple[List[str], List[Tuple[datetime, Dict[str, str]]]]:
-    """Read a vendor export into (column names, [(utc time, values)])."""
+    """Read a vendor export into (column names, [(utc time, values)]).
+
+    Handles an ordinary CSV with a timestamp column, and the two shapes that
+    are not ordinary CSVs at all but are what the instruments here actually
+    write — a Questor5 export of species triples, and a Calisto export whose
+    table has no absolute time in it. Both are recognised from their contents
+    rather than their extension, since neither reliably has one.
+    """
+    kind = export_format(path)
+    if kind == "questor":
+        return load_questor(path, tz_offset_hours)
+    if kind == "calisto":
+        return load_calisto(path, tz_offset_hours)
+
     header, rows = _sniff_rows(path)
     ts_index = _timestamp_column(header, rows)
     columns = [n for i, n in enumerate(header) if i != ts_index]
@@ -153,6 +170,75 @@ def load_export(
         out.append((when - shift, values))
     out.sort(key=lambda item: item[0])
     return columns, out
+
+
+def export_format(path: Path) -> str:
+    """Name the shape of an export: "questor", "calisto", or "csv".
+
+    By inspection, because these files are not self-describing. A Questor
+    export is tab-separated with a Time / Time Relative / Ion Current header;
+    a Calisto export is UTF-16 with a Zone Start Time line above a fixed-width
+    table. Anything else is treated as a plain CSV and has to carry its own
+    absolute timestamps.
+    """
+    head = Path(path).read_bytes()[:4096]
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = head.decode("utf-16", errors="replace")
+    else:
+        text = head.decode("utf-8", errors="replace")
+    if "Time Relative" in text or text.startswith("Sourcefile"):
+        return "questor"
+    if "Zone Start Time" in text:
+        return "calisto"
+    return "csv"
+
+
+def session_clock_offset(session_csv: Path) -> Optional[float]:
+    """Work out how far the local clock ran ahead of UTC during a session.
+
+    A vendor export stamps in local time and a session in UTC, so the two have
+    to be shifted onto each other before they can be joined. Getting that wrong
+    does not fail — it pairs every reading with the wrong row, or with none —
+    so it is derived rather than typed: a session file is *named* in local time
+    and its rows are stamped in UTC, and the difference between the two is the
+    offset that was actually in force, daylight saving included.
+
+    Returns None when the name carries no timestamp or the file has no rows, in
+    which case the caller has to ask.
+    """
+    session_csv = Path(session_csv)
+    stamp = re.search(r"(\d{8})_(\d{6})", session_csv.stem)
+    if not stamp:
+        return None
+    local = datetime.strptime(stamp.group(1) + stamp.group(2), "%Y%m%d%H%M%S")
+
+    first: Optional[datetime] = None
+    try:
+        with session_csv.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                first = parse_timestamp(row.get("timestamp_utc", ""))
+                if first is not None:
+                    break
+    except OSError:
+        return None
+
+    if first is None:
+        # A session recorded with no profile has no rows, only a sidecar.
+        sidecar = session_csv.parent / (session_csv.stem + ".raw.jsonl")
+        try:
+            with sidecar.open("r", encoding="utf-8") as handle:
+                handle.readline()
+                record = json.loads(handle.readline())
+            first = datetime.fromtimestamp(float(record["ts"]), timezone.utc)
+            first = first.replace(tzinfo=None)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            return None
+
+    if first.tzinfo is not None:
+        first = first.astimezone(timezone.utc).replace(tzinfo=None)
+    # Quarter-hour resolution covers every real zone and rejects nothing.
+    return round((local - first).total_seconds() / 900.0) * 0.25
 
 
 def merge_into_session(

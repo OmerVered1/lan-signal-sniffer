@@ -258,9 +258,14 @@ and nothing can be identified from two samples.
 
 ## When the instrument never sends the numbers
 
-If the search above comes back empty on a run where the values genuinely moved,
-they are not derivable from the traffic and the goal still works by another
-route. A session CSV carries capture-clock
+Sometimes the search comes back empty because the numbers were never on the
+wire. The MAX300 in this rig is that case, settled twice over: no field in any
+of its 58 channels decodes into the ion-current range, its detector arrays span
+46 counts on a baseline of 8788 while Questor's own figures moved by 300–700×,
+and the values reach Calisto through a **file** Questor writes rather than over
+the network at all. No amount of sniffing recovers those.
+
+The goal still works by another route. A session CSV carries capture-clock
 timestamps and the vendor export carries its own, so where the clocks agree the
 two can be joined on time: **File → Merge a vendor export into a session…**.
 Pick the session, pick the export, give its columns a prefix, and it writes a
@@ -271,9 +276,21 @@ these are measurements, and inventing values between two samples would put
 numbers in the file that no instrument ever reported. Rows outside the export's
 range are left blank rather than filled, and a merge that matches little says so.
 
-The export needs a column of **absolute dates and times**. A column of elapsed
-seconds cannot be lined up against a capture clock, and is refused rather than
-silently matching nothing.
+Three export shapes are read, recognised by their contents rather than their
+name — a Questor export arrives with no extension at all:
+
+| Shape | What makes it awkward |
+|---|---|
+| **Questor5** | Tab-separated, one Time / Time Relative / Ion Current triple per species, with the species named on the row above the columns. |
+| **Calisto** | UTF-16, a header block, then a fixed-width table whose only time column is elapsed seconds — absolute time exists solely as `Zone Start Time` in the header, and an export missing it is refused rather than placed at an assumed zero. |
+| **Plain CSV** | Needs a column of absolute dates and times. Elapsed seconds alone cannot be lined up against a capture clock, and are refused rather than silently matching nothing. |
+
+**The clock is derived, not typed.** Both vendors stamp in local time and a
+session is stamped in UTC; a wrong shift does not fail, it pairs every reading
+with the wrong row and reports that nothing matched. A session file is *named*
+in local time and its rows are stamped in UTC, so the difference between the two
+is the offset that was actually in force — daylight saving included. The app
+works it out, shows it, and lets you overrule it.
 
 ## What a session produces
 
@@ -323,7 +340,28 @@ since the narrow one is a fragment of it.
 `profiles/*.json` — plain files, no code. `setaram_c80.json` and
 `alexsys_drop.json` ship with their command bytes already filled in, carried
 over from `keithley-smu-control/calorimeter_reader.py` where they were verified
-on the bench. They hold no special status: they are the same kind of file the
+on the bench.
+
+`setaram_oven_calisto.json` was written from a 19.5-hour TPD capture and is the
+worked example of what identification looks like when it goes well. Everything
+Calisto plots arrives in the reply to the two-byte request `0008`: a 43-byte
+frame holding the whole row as seven big-endian float32. One frame decoded to
+`22.557554 / 22.730051 / 20287.716797 / 28.81 / 3.784194 / 20.023611 / 0.0`
+against a Calisto row of `25.557554 / 22.730051 / …` — bit-exact on five of
+seven, and replaying the whole run through the decoder gives **RMSE 0.16 °C** on
+temperature, the residual being Calisto's own 3.3 s logging interval.
+
+Two things about it are worth knowing, because both are traps:
+
+* That channel answers in **two shapes** — a 6-byte "nothing new" ack and the
+  full frame — and the ack is the more common of the two (29,723 against
+  12,925). Anything that analyses only a channel's most common reply length
+  keeps the acks and throws away every reading.
+* `sample_temperature` carries `bias: 3.0` deliberately. The wire runs exactly
+  3.000000 °C below what Calisto displays — a probe calibration applied inside
+  Calisto — and the profile reproduces what Calisto shows, because that is the
+  number the experiment is recorded against. Set the bias to 0.0 for the
+  uncorrected probe. They hold no special status: they are the same kind of file the
 wizard writes for any device, and the test suite checks that the generic scan
 rediscovers the C80's channels on its own.
 

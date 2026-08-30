@@ -164,7 +164,11 @@ class MainWindow(QMainWindow):
         Where the clocks agree the two files can be joined on time instead,
         which reaches the same combined table by another route.
         """
-        from ..writers.merge import merge_into_session
+        from ..writers.merge import (
+            export_format,
+            merge_into_session,
+            session_clock_offset,
+        )
 
         session, _f = QFileDialog.getOpenFileName(
             self, "Which recorded session?", str(self._output_dir), "Session CSV (*.csv)"
@@ -175,12 +179,48 @@ class MainWindow(QMainWindow):
             self,
             "Which vendor export?",
             str(Path(session).parent),
-            "Exports (*.csv *.txt *.tsv);;All files (*)",
+            # All files first, and deliberately: a Questor export arrives with
+            # no extension at all, so an extension filter hides the very file
+            # this was built to read.
+            "All files (*);;Exports (*.csv *.txt *.tsv)",
         )
         if not export:
             return
 
         from PyQt5.QtWidgets import QInputDialog
+
+        kind = export_format(Path(export))
+        reader = {
+            "questor": "a Questor5 export (species / ion current)",
+            "calisto": "a Calisto export (elapsed times, placed by Zone Start Time)",
+            "csv": "a plain CSV with its own timestamp column",
+        }[kind]
+
+        # A vendor export stamps in local time and a session in UTC. Guessing
+        # wrong here does not fail — it silently matches nothing — so the offset
+        # is derived from the session's own name against its own rows, and shown
+        # for confirmation rather than assumed.
+        derived = session_clock_offset(Path(session))
+        offset, ok = QInputDialog.getDouble(
+            self,
+            "Clock offset",
+            f"Reading this as {reader}.\n\n"
+            + (
+                f"This session was recorded {derived:+g} h from UTC, so that is "
+                "how far the export's stamps will be shifted back. Change it "
+                "only if the export came from a machine on a different clock."
+                if derived is not None
+                else "The session's own clock offset could not be worked out "
+                "from its name, so this has to be set by hand: how many hours "
+                "is the export's clock ahead of UTC?"
+            ),
+            derived if derived is not None else 0.0,
+            -14.0,
+            14.0,
+            2,
+        )
+        if not ok:
+            return
 
         prefix, ok = QInputDialog.getText(
             self,
@@ -196,7 +236,11 @@ class MainWindow(QMainWindow):
         out = Path(session).with_name(Path(session).stem + "_merged.csv")
         try:
             result = merge_into_session(
-                Path(session), Path(export), out, prefix=prefix.strip()
+                Path(session),
+                Path(export),
+                out,
+                prefix=prefix.strip(),
+                tz_offset_hours=offset,
             )
         except Exception as e:
             QMessageBox.critical(self, "Could not merge", str(e))
@@ -207,6 +251,13 @@ class MainWindow(QMainWindow):
             f"reading ({result.coverage:.0%}).\n\n"
             f"Added: {', '.join(result.added_columns)}\n\nSaved as {out.name}"
         )
+        if result.rows and result.coverage < 0.5:
+            # Almost always the clock, and worth saying so before the file is
+            # taken away and puzzled over.
+            message += (
+                "\n\nMost rows matched nothing. The usual cause is the clock "
+                f"offset — this merge used {offset:+g} h."
+            )
         if result.warnings:
             message += "\n\n" + "\n".join(result.warnings)
         QMessageBox.information(self, "Merged", message)
