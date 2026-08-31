@@ -14,6 +14,7 @@ window's, because they are common to the whole setup.
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -772,6 +773,10 @@ class MainWindow(QMainWindow):
         if dialog.exec_() != QuestorSetupDialog.Accepted:
             return
 
+        if not monitor.config.label or monitor.config.label.startswith("Device "):
+            # The name becomes the prefix on fifteen columns, and "device_1" is
+            # not what anyone wants to read six months later.
+            monitor.config.label = "questor"
         monitor.config.questor_host = dialog.host
         monitor.config.questor_port = dialog.port
         monitor.config.questor_interval_s = dialog.interval_s
@@ -1281,5 +1286,11 @@ def _unclaimed(base: Path) -> Path:
 
 
 def _slug(text: str) -> str:
+    """A column prefix or filename stem, from whatever the device is called.
+
+    Runs of separators collapse: "Setaram Oven (Calisto)" has a space before a
+    bracket and becomes setaram_oven_calisto rather than a name with a double
+    underscore in the middle of it, which every column then carries.
+    """
     keep = [c.lower() if c.isalnum() else "_" for c in text.strip()]
-    return "".join(keep).strip("_") or "device"
+    return re.sub(r"_+", "_", "".join(keep)).strip("_") or "device"

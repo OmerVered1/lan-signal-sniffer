@@ -72,7 +72,11 @@ class SessionCSVWriter:
         # first would backdate it into the wrong row.
         if self._row and self._row_ts is not None:
             repeats = any(name in self._row for name in values)
-            expired = ts - self._row_ts > self.row_timeout
+            # Either direction. A device that answers with a short history
+            # delivers older readings after newer ones, and folding one of
+            # those into the open row would stamp it with a moment it did not
+            # happen at - which is worse than giving it a row of its own.
+            expired = abs(ts - self._row_ts) > self.row_timeout
             if repeats or expired:
                 self._flush()
 

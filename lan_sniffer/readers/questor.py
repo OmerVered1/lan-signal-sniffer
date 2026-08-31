@@ -190,6 +190,29 @@ class CurlTransport(Transport):
         if not self.exe:
             raise RuntimeError("curl was not found on this machine")
 
+    @staticmethod
+    def _hidden() -> dict:
+        """Keep Windows from flashing a console window for every request.
+
+        A GUI application spawning a console program gets a new console for it,
+        and at one request every few seconds that is a black window appearing
+        and vanishing all day. It is only cosmetic, and it makes the app look
+        broken enough that nobody would leave it running for a thirteen-hour
+        experiment - which is the entire point of it.
+        """
+        import subprocess
+        import sys
+
+        if not sys.platform.startswith("win"):
+            return {}
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0  # SW_HIDE, for consoles that appear anyway
+        return {
+            "startupinfo": startupinfo,
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        }
+
     def post(self, url: str, body: bytes, timeout_s: float) -> bytes:
         import subprocess
         import tempfile
@@ -210,6 +233,7 @@ class CurlTransport(Transport):
                 ],
                 capture_output=True,
                 timeout=timeout_s + 5,
+                **self._hidden(),
             )
         finally:
             try:
@@ -249,7 +273,9 @@ class WinHttpTransport(Transport):
 def open_transport() -> Transport:
     """Whichever way of sending a request this machine actually has."""
     problems = []
-    for factory in (CurlTransport, WinHttpTransport):
+    # WinHTTP first where it exists: it is in-process, so there is no console
+    # to suppress and no program to find, and it keeps its connection open.
+    for factory in (WinHttpTransport, CurlTransport):
         try:
             return factory()
         except Exception as e:  # ImportError, RuntimeError, COM errors
@@ -280,6 +306,12 @@ class QuestorClient:
     timeout_s: float = DEFAULT_TIMEOUT_S
     transport: Optional[Transport] = None
     last_error: str = ""
+    # When this client started looking. Each poll asks for several results so
+    # that a late one can catch up, which means the first reply carries a
+    # history reaching back before the app was even watching. Those are real
+    # measurements, but they are not part of this recording, and writing them
+    # into it would put readings in a session that predate it.
+    since: Optional[datetime] = None
     _seen: set = field(default_factory=set)
 
     @property
@@ -299,6 +331,7 @@ class QuestorClient:
         """Forget what has been seen, so a new session starts clean."""
         self._seen.clear()
         self.last_error = ""
+        self.since = None
 
     def poll(self) -> List[ResultSet]:
         """Result sets that have appeared since the last call, oldest first."""
@@ -312,7 +345,16 @@ class QuestorClient:
             return []
         self.last_error = ""
 
-        fresh = [r for r in results if r.key not in self._seen]
+        if self.since is None and results:
+            # The oldest of the first reply is where this recording begins:
+            # anything at or before it happened before anyone was watching.
+            self.since = results[0].when
+
+        fresh = [
+            r for r in results
+            if r.key not in self._seen
+            and (self.since is None or r.when >= self.since)
+        ]
         for result in fresh:
             self._seen.add(result.key)
         if len(self._seen) > 4096:

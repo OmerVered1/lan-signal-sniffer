@@ -220,3 +220,27 @@ def test_two_instruments_are_not_analysed_as_one(tmp_path):
         )
 
     assert len(group_chunks_by_flow(chunks)) == 2, "one bucket would merge them"
+
+
+def test_an_older_reading_does_not_join_the_row_that_is_open(tmp_path):
+    """A device that answers with a short history delivers old after new.
+
+    Folding one of those into the open row stamps it with a moment it did not
+    happen at - and the readings either side of it are half a minute apart.
+    """
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temperature", "concentration"]) as w:
+        w.add(1000.0, {"temperature": 20.0})
+        w.add(1000.5, {"temperature": 20.1})
+        # Twenty-four seconds older than the open row.
+        w.add(976.0, {"concentration": 1.5})
+        w.add(1001.0, {"temperature": 20.2})
+
+    rows = path.read_text(encoding="utf-8").splitlines()[1:]
+    stamped = [r.split(",")[0] for r in rows if "1.5" in r]
+    assert stamped, "the old reading must still be written"
+    assert stamped[0].endswith("16:16.000"), (
+        f"it must carry its own time, not the open row's: {stamped[0]}"
+    )

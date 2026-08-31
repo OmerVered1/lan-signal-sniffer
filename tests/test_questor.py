@@ -248,3 +248,39 @@ def test_a_questor_device_never_drives_a_session():
     m = DeviceMonitor(config=DeviceConfig(label="ms", questor_host="localhost"))
     assert m.reads_questor
     assert m.detector is None, "no profile, so nothing can open or close a file"
+
+
+# ----- what belongs in this recording ----------------------------------------
+
+
+def test_results_from_before_we_started_looking_are_not_recorded():
+    """Every poll asks for several, so the first reply reaches back in time.
+
+    Those are real measurements, but they happened before anyone was watching,
+    and writing them into a session would put readings in it that predate it.
+    """
+    c = client_with([
+        response_with([
+            "2026-08-31T13:19:22.809",
+            "2026-08-31T13:19:30.730",
+            "2026-08-31T13:19:38.589",
+        ]),
+        response_with([
+            "2026-08-31T13:19:30.730",
+            "2026-08-31T13:19:38.589",
+            "2026-08-31T13:19:46.433",
+        ]),
+    ])
+    first = c.poll()
+    # The oldest of the first reply is where this recording begins.
+    assert [r.when.strftime("%H:%M:%S") for r in first] == [
+        "13:19:22", "13:19:30", "13:19:38",
+    ]
+    assert [r.when.strftime("%H:%M:%S") for r in c.poll()] == ["13:19:46"]
+
+
+def test_a_reset_starts_the_history_again():
+    c = client_with([response_with(["2026-08-31T13:19:22.809"])] * 2)
+    assert len(c.poll()) == 1
+    c.reset()
+    assert len(c.poll()) == 1, "after a reset the next reply is the new baseline"
