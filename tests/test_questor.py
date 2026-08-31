@@ -268,7 +268,9 @@ def test_its_columns_are_prefixed_when_it_shares_a_file():
 
 def test_its_columns_and_units_come_from_what_it_answered():
     m = monitor_reading([response_with(["2026-08-31T13:19:51.147"])])
-    assert m.signal_names() == [], "nothing is known before the first reply"
+    # The priming reply is not recorded, but it names the tags - and a session
+    # opening straight afterwards has no later reply to learn them from.
+    assert m.signal_names(), "the priming reply must still name the columns"
     m.poll()
     names = m.signal_names()
     assert "V1_I_18" in names and "V1_C_H2" in names
@@ -326,3 +328,25 @@ def test_a_test_read_raises_the_reason_rather_than_going_quiet():
     c.transport = FakeTransport([RuntimeError("HTTP 401 Unauthorized")])
     with pytest.raises(RuntimeError, match="401"):
         c.latest()
+
+
+def test_the_unrecorded_first_reply_still_names_the_columns():
+    """The bug this guards: a session opens with no columns for this device.
+
+    The first reply is history and none of it is recorded, but it is usually
+    the only reply that has arrived by the time a session fixes its header. A
+    priming poll that learned nothing left fifteen empty columns in the file.
+    """
+    c = client_with([], prime=False)
+    c.transport = FakeTransport([REAL])
+    assert c.poll() == [], "its readings belong to no recording"
+    assert "V1_C_O2" in c.tags, "but its names describe the instrument"
+    assert c.units["V1_C_O2"] == "%"
+
+
+def test_a_reset_keeps_the_names_and_forgets_the_readings():
+    c = client_with([response_with(["2026-08-31T13:19:51.147"])] * 3)
+    assert c.tags
+    c.reset()
+    assert c.tags, "a session cannot gain columns after writing its header"
+    assert c.since is None

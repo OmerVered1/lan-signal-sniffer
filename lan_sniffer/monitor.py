@@ -126,19 +126,19 @@ class DeviceMonitor:
 
     def signal_names(self) -> List[str]:
         if self.reads_questor:
-            # Questor names its own tags, and they are only known once it has
-            # answered - so a session opened before the first reply has nothing
-            # to write for this device, and gains the columns when it does.
-            return [self.qualify(name) for name in self._questor_tags]
+            # Questor names its own tags, and they are known from its first
+            # reply - including the one whose readings are not recorded.
+            return [self.qualify(name) for name in self._questor_names()]
         if not self.profile:
             return []
         return [self.qualify(name) for name in self.profile.signal_names]
 
     def units(self) -> Dict[str, str]:
         if self.reads_questor:
+            units = self.questor.units if self.questor else {}
             return {
-                self.qualify(name): self._questor_units.get(name, "")
-                for name in self._questor_tags
+                self.qualify(name): units.get(name, "")
+                for name in self._questor_names()
             }
         if not self.profile:
             return {}
@@ -215,20 +215,17 @@ class DeviceMonitor:
             self.last_error = str(e)
             return
 
-        # Ask once now, to learn the tag names. A session fixes its columns
-        # when it opens, and a recording that starts the moment the oven does
-        # would otherwise have no columns for this device at all - its first
-        # answer would arrive too late to be in the header.
+        # Ask once now. A session fixes its columns when it opens, and a
+        # recording that starts the moment the oven does would otherwise have
+        # no columns for this device at all.
         #
-        # The readings from this poll are deliberately dropped: nothing is
-        # recording yet, and keeping them would file measurements taken before
-        # the run under the run.
+        # This poll returns nothing: its reply is the instrument's own history,
+        # from before anyone was watching, and recording it would file readings
+        # under a run that had not started. The tag names it carries are kept
+        # regardless - they describe the instrument, not the recording, and
+        # they are usually all that is known by the time a session opens.
         try:
-            for entry in self.questor.poll():
-                for name in entry.values:
-                    if name not in self._questor_tags:
-                        self._questor_tags.append(name)
-                self._questor_units.update(entry.units)
+            self.questor.poll()
         except Exception as e:
             self.last_error = str(e)
         self._next_questor = time.time() + max(0.0, self.config.questor_interval_s)
@@ -252,6 +249,9 @@ class DeviceMonitor:
             return self._poll_registers()
         return self._poll_capture()
 
+    def _questor_names(self) -> List[str]:
+        return list(self.questor.tags) if self.questor else []
+
     def _poll_questor(self) -> PollResult:
         """Ask Questor for results, no more often than they are produced."""
         result = PollResult()
@@ -268,10 +268,6 @@ class DeviceMonitor:
         from .readers.questor import local_to_epoch
 
         for entry in self.questor.poll():
-            for name in entry.values:
-                if name not in self._questor_tags:
-                    self._questor_tags.append(name)
-            self._questor_units.update(entry.units)
             result.samples.append(
                 Sample(
                     ts=local_to_epoch(entry.when),

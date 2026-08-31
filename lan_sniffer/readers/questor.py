@@ -312,6 +312,12 @@ class QuestorClient:
     # measurements, but they are not part of this recording, and writing them
     # into it would put readings in a session that predate it.
     since: Optional[datetime] = None
+    # Every tag name and unit seen, including from the first reply that is not
+    # recorded. A session fixes its columns when it opens, so the names have to
+    # be known before then - and the reply that establishes the history
+    # boundary is usually the only one that has arrived by that point.
+    tags: List[str] = field(default_factory=list)
+    units: Dict[str, str] = field(default_factory=dict)
     _seen: set = field(default_factory=set)
 
     @property
@@ -332,6 +338,9 @@ class QuestorClient:
         self._seen.clear()
         self.last_error = ""
         self.since = None
+        # Tag names are deliberately kept: they describe the instrument, not
+        # the recording, and a session that has already written its header
+        # cannot gain columns afterwards.
 
     def poll(self) -> List[ResultSet]:
         """Result sets that have appeared since the last call, oldest first."""
@@ -344,6 +353,7 @@ class QuestorClient:
             self.last_error = str(e)
             return []
         self.last_error = ""
+        self._learn(results)
 
         if self.since is None and results:
             # The whole of the first reply is history. Every poll asks for
@@ -386,7 +396,17 @@ class QuestorClient:
         if self.transport is None:
             self.open()
         payload = self.transport.post(self.url, build_request(self.count), self.timeout_s)
-        return parse_results(payload)
+        results = parse_results(payload)
+        self._learn(results)
+        return results
+
+    def _learn(self, results: Sequence[ResultSet]) -> None:
+        """Remember what this instrument calls things, whatever is recorded."""
+        for result in results:
+            for name in result.values:
+                if name not in self.tags:
+                    self.tags.append(name)
+            self.units.update(result.units)
 
     def status(self) -> str:
         if self.last_error:
