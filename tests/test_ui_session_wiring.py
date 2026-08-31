@@ -324,8 +324,8 @@ def test_relabelling_devices_does_not_pile_up_legend_entries(qapp):
     for _ in range(4):
         view.set_signals(names, {})
     assert len(view._curves) == len(names)
-    assert len(view._legend.items) == len(names)
     assert view._legend_row.count() == len(names)
+    assert len(view._boxes) == len(names)
 
 
 def test_the_plot_drops_signals_that_are_gone(qapp):
@@ -335,7 +335,7 @@ def test_the_plot_drops_signals_that_are_gone(qapp):
     view.set_signals(["a", "b", "c"], {})
     view.set_signals(["a"], {})
     assert list(view._curves) == ["a"]
-    assert len(view._legend.items) == 1
+    assert view._legend_row.count() == 1
 
 
 # ----- a coupled rig: one instrument owns the experiment ---------------------

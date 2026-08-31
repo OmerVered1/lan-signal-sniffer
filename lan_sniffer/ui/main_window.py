@@ -14,6 +14,7 @@ window's, because they are common to the whole setup.
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
+    QApplication,
     QCheckBox,
     QInputDialog,
     QComboBox,
@@ -90,6 +92,9 @@ class MainWindow(QMainWindow):
         self._capturing = False
         self._csv: Optional[SessionCSVWriter] = None
         self._raw: Optional[RawWriter] = None
+        # The newest reading of each signal, per device, for the panels to show.
+        self._latest: Dict[int, Dict[str, float]] = {}
+        self._dark = False
         self._output_dir = Path.home() / "LAN Sniffer Sessions"
         self._session_started: Optional[float] = None
         self._survey_raw: Optional[RawWriter] = None
@@ -122,6 +127,12 @@ class MainWindow(QMainWindow):
             "session, joined on the clock."
         )
         merge.triggered.connect(self._merge_export)
+
+        view_menu = self.menuBar().addMenu("&View")
+        self._dark_action = view_menu.addAction("Dark theme")
+        self._dark_action.setCheckable(True)
+        self._dark_action.setChecked(_remembered_theme())
+        self._dark_action.toggled.connect(self._on_theme_toggled)
 
         help_menu = self.menuBar().addMenu("&Help")
 
@@ -283,14 +294,11 @@ class MainWindow(QMainWindow):
 
         self._banner = QLabel("\u25cb  NOT RECORDING")
         self._banner.setAlignment(Qt.AlignCenter)
-        self._banner.setStyleSheet(
-            "background:#e8e8e8; color:#555; font-weight:bold; font-size:15px; "
-            "padding:9px; border-radius:4px;"
-        )
+        self._banner.setStyleSheet(_banner_style(self._dark, False))
         self._session_label = QLabel("No session.")
         self._session_label.setWordWrap(True)
         self._session_label.setTextFormat(Qt.RichText)
-        self._session_label.setStyleSheet("color:#555; font-size:11px;")
+        self._session_label.setStyleSheet(_muted_style(self._dark))
         self._session_label.setMinimumHeight(46)
 
         self._start_btn = QPushButton("Start session")
@@ -300,8 +308,13 @@ class MainWindow(QMainWindow):
         self._stop_btn.clicked.connect(lambda: self._close_session(manual=True))
         self._split_btn.clicked.connect(self._split_session)
 
-        self._output_label = QLabel(str(self._output_dir))
+        self._output_label = QLabel()
         self._output_label.setWordWrap(True)
+        self._output_label.setTextFormat(Qt.RichText)
+        self._output_label.setToolTip("Open the folder sessions are written to")
+        self._output_label.setOpenExternalLinks(False)
+        self._output_label.linkActivated.connect(lambda _: self._open_output_dir())
+        self._show_output_dir()
         choose_dir = QPushButton("Change folder\u2026")
         choose_dir.clicked.connect(self._choose_output_dir)
 
@@ -607,6 +620,10 @@ class MainWindow(QMainWindow):
             for event, ts in result.events:
                 self._on_device_event(monitor, event, ts)
 
+            if result.samples:
+                self._latest.setdefault(id(monitor), {}).update(
+                    result.samples[-1].values
+                )
             for sample in result.samples:
                 self._live.add(sample.ts, sample.values)
                 if self._csv is not None:
@@ -615,13 +632,7 @@ class MainWindow(QMainWindow):
             if monitor.tick(time.time()) == "stop":
                 self._on_device_event(monitor, "stop", time.time())
 
-        status = " · ".join(
-            [f"{m.name}: {m.status()}" for m in self._monitors]
-            + [f"{buffered} chunks buffered"]
-        )
-        if self._survey_raw is not None:
-            status += f" · survey: {self._survey_raw.chunks_written} chunks recorded"
-        self.statusBar().showMessage(status)
+        self._refresh_device_states(buffered)
         self._update_session_label()
 
     def _on_device_event(self, monitor: DeviceMonitor, event: str, ts: float) -> None:
@@ -1159,7 +1170,7 @@ class MainWindow(QMainWindow):
         )
         if chosen:
             self._output_dir = Path(chosen)
-            self._output_label.setText(chosen)
+            self._show_output_dir()
 
     # ----- state ----------------------------------------------------------
 
@@ -1189,10 +1200,7 @@ class MainWindow(QMainWindow):
                 f"⏺  RECORDING   {elapsed // 60:d}:{elapsed % 60:02d}   ·   "
                 f"{what}{across}"
             )
-            self._banner.setStyleSheet(
-                "background:#1a7f37; color:white; font-weight:bold; "
-                "font-size:15px; padding:9px; border-radius:4px;"
-            )
+            self._banner.setStyleSheet(_banner_style(self._dark, True))
             target = Path(self._csv.path).name
             if not self._csv.signal_names:
                 target = target[:-4] + ".raw.jsonl" if target.endswith(".csv") else target
@@ -1212,10 +1220,7 @@ class MainWindow(QMainWindow):
         detector = monitor.detector if monitor is not None else None
         automatic = bool(armed)
         self._banner.setText("○  NOT RECORDING" + ("   ·   armed" if automatic else ""))
-        self._banner.setStyleSheet(
-            "background:#e8e8e8; color:#555; font-weight:bold; font-size:15px; "
-            "padding:9px; border-radius:4px;"
-        )
+        self._banner.setStyleSheet(_banner_style(self._dark, False))
 
         if not automatic:
             self._session_label.setText(
@@ -1253,6 +1258,72 @@ class MainWindow(QMainWindow):
                 + "\n  ".join(detector.near_misses)
             )
         self._session_label.setToolTip("\n".join(detail))
+
+    def _refresh_device_states(self, buffered: int = 0) -> None:
+        """Say what each device is doing, on the device.
+
+        This used to be one line of packet counts along the bottom of the
+        window - a number nobody needed, for every device at once, in the one
+        place least attached to the thing it described.
+        """
+        recording = self._csv is not None
+        for form in self._device_forms:
+            monitor = form.monitor
+            text, colour = _device_state(monitor, recording, self._capturing)
+            form.show_state(text, colour, monitor.status())
+            form.show_relevant_fields()
+            form.show_values(self._latest.get(id(monitor), {}), monitor.units())
+        detail = " · ".join(f"{m.name}: {m.status()}" for m in self._monitors)
+        if buffered:
+            detail += f" · {buffered} chunks buffered"
+        if self._survey_raw is not None:
+            detail += f" · survey: {self._survey_raw.chunks_written} chunks"
+        self.statusBar().showMessage(detail)
+        self._refresh_title()
+
+    def _refresh_title(self) -> None:
+        """Put the state where it can be read from the taskbar."""
+        base = f"{__app_name__} {__version__}"
+        if self._csv is not None and self._session_started is not None:
+            elapsed = int(time.time() - self._session_started)
+            self.setWindowTitle(
+                f"\u25cf recording  {elapsed // 60:d}:{elapsed % 60:02d}  \u2014 {base}"
+            )
+        elif self._capturing:
+            self.setWindowTitle(f"watching \u2014 {base}")
+        else:
+            self.setWindowTitle(base)
+
+    def _on_theme_toggled(self, dark: bool) -> None:
+        _remember_theme(bool(dark))
+        self._apply_theme(dark)
+
+    def _apply_theme(self, dark: bool) -> None:
+        """Switch the whole window, and the chart, which styles itself."""
+        from . import theme as _theme
+
+        self._dark = bool(dark)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(_theme.stylesheet(self._dark))
+        self._live.set_theme(self._dark)
+        for form in self._device_forms:
+            form.set_theme(self._dark)
+        self._session_label.setStyleSheet(_theme.muted(self._dark))
+        self._update_session_label()
+
+    def _show_output_dir(self) -> None:
+        self._output_label.setText(
+            f'<a href="#" style="color:#1f77b4;">{self._output_dir}</a>'
+        )
+
+    def _open_output_dir(self) -> None:
+        """Open the session folder, rather than making it something to retype."""
+        from PyQt5.QtCore import QUrl
+        from PyQt5.QtGui import QDesktopServices
+
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._output_dir)))
 
     def _refresh_titles(self) -> None:
         for form in self._device_forms:
@@ -1304,3 +1375,71 @@ def _slug(text: str) -> str:
     """
     keep = [c.lower() if c.isalnum() else "_" for c in text.strip()]
     return re.sub(r"_+", "_", "".join(keep)).strip("_") or "device"
+
+
+# The five states a device can be in, and what each looks like. Colour carries
+# the urgency and the word carries the meaning; neither alone is enough.
+_STATE_COLOURS = {
+    "error": "#c0392b",
+    "recording": "#1a7f37",
+    "live": "#1f77b4",
+    "waiting": "#b7791f",
+    "idle": "#888888",
+}
+
+
+def _theme_file() -> Path:
+    return user_profile_dir().parent / "appearance.json"
+
+
+def _remembered_theme() -> bool:
+    """Whether dark was chosen last time. A preference, so a missing or
+    unreadable file is simply "not yet chosen" rather than an error."""
+    try:
+        return bool(json.loads(_theme_file().read_text(encoding="utf-8"))["dark"])
+    except Exception:
+        return False
+
+
+def _remember_theme(dark: bool) -> None:
+    try:
+        path = _theme_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"dark": dark}), encoding="utf-8")
+    except OSError:
+        # Losing a preference is not worth interrupting anyone over.
+        pass
+
+
+def _muted_style(dark: bool) -> str:
+    from .theme import muted
+
+    return muted(dark)
+
+
+def _banner_style(dark: bool, recording: bool) -> str:
+    from .theme import banner_style
+
+    return banner_style(dark, recording)
+
+
+def _device_state(monitor, recording: bool, capturing: bool):
+    """One line describing what this device is doing, and a colour for it."""
+    if monitor.last_error:
+        return f"problem — {monitor.last_error}", _STATE_COLOURS["error"]
+    if not capturing:
+        return "idle", _STATE_COLOURS["idle"]
+    if monitor.reads_questor:
+        what = "reading Questor"
+    elif monitor.reads_registers:
+        what = "reading registers"
+    else:
+        what = "watching traffic"
+    if recording:
+        # A device without a profile contributes raw traffic and no columns,
+        # and saying "recording" of it would overstate what is being kept.
+        kept = "recording" if monitor.signal_names() else "recording (raw only)"
+        return f"{kept} — {what}", _STATE_COLOURS["recording"]
+    if monitor.detector is not None and monitor.config.controls_recording:
+        return f"{what} — waiting for a run", _STATE_COLOURS["waiting"]
+    return what, _STATE_COLOURS["live"]

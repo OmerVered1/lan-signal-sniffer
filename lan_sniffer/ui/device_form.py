@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -23,7 +23,9 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -48,6 +50,24 @@ class DeviceForm(QGroupBox):
     def __init__(self, monitor: DeviceMonitor, parent=None) -> None:
         super().__init__(parent)
         self.monitor = monitor
+        self._menu_actions = []
+
+        # What this device is doing right now, in one line and one colour.
+        # Packet counts buried in the status bar answered a question nobody was
+        # asking; whether an instrument is alive is the one that matters.
+        self._state = QLabel()
+        self._state.setTextFormat(Qt.RichText)
+        self._state.setContentsMargins(6, 2, 6, 2)
+
+        # The current value of every signal. Without this the only way to see a
+        # number was to open the identify dialog, which is a strange place to
+        # go to answer "is the oven at temperature yet".
+        self._readout = QLabel()
+        self._readout.setTextFormat(Qt.RichText)
+        self._readout.setWordWrap(True)
+        self._readout.setContentsMargins(8, 2, 8, 4)
+        self._readout.setStyleSheet(_readout_style(False))
+        self._readout.hide()
 
         self._label = QLineEdit()
         self._label.setPlaceholderText("a short name, e.g. oven")
@@ -70,7 +90,7 @@ class DeviceForm(QGroupBox):
         self._address.setMinimumWidth(170)
         self._address.editTextChanged.connect(lambda _t: self._emit_changed())
         self._refresh = QPushButton("Refresh")
-        address_row = QHBoxLayout()
+        self._address_row = address_row = QHBoxLayout()
         address_row.addWidget(self._address, 1)
         address_row.addWidget(self._refresh)
 
@@ -132,18 +152,34 @@ class DeviceForm(QGroupBox):
         self._survey.clicked.connect(lambda: self.survey_requested.emit(self.monitor))
         self._remove.clicked.connect(lambda: self.remove_requested.emit(self.monitor))
 
-        actions = QGridLayout()
-        actions.setContentsMargins(8, 0, 8, 4)
-        for i, button in enumerate(
-            (self._identify, self._calibrate, self._import, self._modbus,
-             self._questor, self._survey, self._remove)
-        ):
-            actions.addWidget(button, i // 2, i % 2)
+        # Most of these are used once per instrument, ever. Left on the card
+        # they are seven buttons per device competing with the two that get
+        # pressed during a run.
+        self._setup = QPushButton("Set up  \u25be")
+        menu = QMenu(self._setup)
+        for button in (self._calibrate, self._import, self._modbus, self._questor):
+            action = menu.addAction(button.text())
+            action.setToolTip(button.toolTip())
+            action.triggered.connect(button.click)
+            self._menu_actions.append((action, button))
+        menu.addSeparator()
+        remove = menu.addAction(self._remove.text())
+        remove.triggered.connect(self._remove.click)
+        self._menu_actions.append((remove, self._remove))
+        self._setup.setMenu(menu)
 
+        actions = QHBoxLayout()
+        actions.setContentsMargins(8, 0, 8, 4)
+        for button in (self._identify, self._survey, self._setup):
+            actions.addWidget(button)
+
+        self._form = form
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(self._state)
         layout.addLayout(form)
         layout.addLayout(actions)
+        layout.addWidget(self._readout)
 
     # ----- wiring ---------------------------------------------------------
 
@@ -252,6 +288,66 @@ class DeviceForm(QGroupBox):
         kind = " · Modbus" if self.monitor.reads_registers else ""
         self.setTitle(f"{self.monitor.name}{kind}{mark}")
 
+    def show_relevant_fields(self) -> None:
+        """Hide the settings this kind of device has no use for.
+
+        A device read from its own software is addressed in its own dialog: an
+        adapter, an IP address, a port and a profile are four questions it
+        cannot answer, and leaving them on the card made it look misconfigured
+        when it was working.
+        """
+        reader = self.monitor.reads_questor
+        for widget in (self._interface, self._port, self._profile):
+            self._set_row_visible(widget, not reader)
+        # The address sits in a row with its Refresh button, so the form knows
+        # it by the layout rather than by the field, and hiding the field alone
+        # leaves the word "Address" behind with nothing beside it.
+        self._address.setVisible(not reader)
+        self._refresh.setVisible(not reader)
+        label = self._form.labelForField(self._address_row)
+        if label is not None:
+            label.setVisible(not reader)
+        self._controls.setVisible(not reader)
+        self._identify.setVisible(not reader)
+        self._survey.setVisible(not reader)
+
+    def _set_row_visible(self, field: QWidget, visible: bool) -> None:
+        field.setVisible(visible)
+        label = self._form.labelForField(field)
+        if label is not None:
+            label.setVisible(visible)
+
+    def set_theme(self, dark: bool) -> None:
+        self._readout.setStyleSheet(_readout_style(dark))
+
+    def show_state(self, text: str, colour: str, detail: str = "") -> None:
+        """The device's own status line, in its own panel."""
+        self._state.setText(
+            f'<span style="color:{colour}; font-weight:bold;">\u25cf</span> '
+            f'<span style="color:{colour};">{text}</span>'
+        )
+        self._state.setToolTip(detail or text)
+
+    def show_values(self, values, units) -> None:
+        """The latest reading of each signal, or nothing if there are none."""
+        if not values:
+            self._readout.hide()
+            return
+        cells = []
+        for name, value in values.items():
+            unit = units.get(name, "")
+            short = name.split(".", 1)[-1]
+            cells.append(
+                f'<td style="padding-right:10px; color:#666;">{short}</td>'
+                f'<td style="padding-right:14px; text-align:right;">'
+                f'<b>{_readable(value)}</b> <span style="color:#888;">{unit}</span></td>'
+            )
+        rows = "".join(
+            "<tr>" + "".join(cells[i : i + 2]) + "</tr>" for i in range(0, len(cells), 2)
+        )
+        self._readout.setText(f"<table>{rows}</table>")
+        self._readout.show()
+
     def set_enabled_for_capture(self, capturing: bool, removable: bool) -> None:
         """Lock settings while running; leave the setup actions judged separately."""
         for widget in (self._address, self._port, self._interface, self._label,
@@ -265,6 +361,37 @@ class DeviceForm(QGroupBox):
         self._identify.setEnabled(sniffing)
         self._calibrate.setEnabled(sniffing)
         self._survey.setEnabled(sniffing)
+        # Last, once every button has been judged: the menu items only mirror
+        # the buttons they stand for, and mirroring them early copies a state
+        # that is about to change.
+        self._setup.setEnabled(True)
+        for action, button in self._menu_actions:
+            action.setEnabled(button.isEnabled())
 
     def _emit_changed(self) -> None:
         self.changed.emit(self.monitor)
+
+
+def _readout_style(dark: bool) -> str:
+    from .theme import readout
+
+    return readout(dark)
+
+
+def _readable(value: float) -> str:
+    """A number a person can take in at a glance.
+
+    Signals here span ion currents around 1e-7 and heat flow above 20,000, so
+    one fixed format cannot serve both: the small ones would read as zero and
+    the large ones would carry meaningless decimals.
+    """
+    magnitude = abs(value)
+    if value == 0:
+        return "0"
+    if magnitude >= 1000:
+        return f"{value:,.0f}"
+    if magnitude >= 1:
+        return f"{value:.3f}"
+    if magnitude >= 0.001:
+        return f"{value:.5f}"
+    return f"{value:.3e}"

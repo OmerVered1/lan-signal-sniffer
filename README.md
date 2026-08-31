@@ -109,6 +109,33 @@ fires at random; recording still works from the buttons.
 **5. Leave it running.** Sessions open and close on their own, and *Start*,
 *Stop* and *Split here* are always available.
 
+## The window
+
+**The chart groups signals by unit into stacked panels sharing one time axis.**
+This is not decoration. A coupled rig feeds it heat flow at 20,287 µV, a gas
+pressure at 1,600 mBar, temperatures reaching 1,000 °C, percentages, flows
+around 20 ml/min and mass concentrations of a hundredth of a percent — on one
+linear axis the largest number sets the scale and everything else is a flat line
+along the bottom. Five small charts that work beat one large one that does not.
+**Normalise** puts every curve on one panel scaled to its own range, for when
+the shape matters and the magnitude does not.
+
+Curve colours are keyed to the signal's name rather than its position, so adding
+a device does not reshuffle every trace mid-run.
+
+**Each device panel says what that device is doing and what it is reading** — a
+coloured state line (*watching traffic*, *reading Questor*, *waiting for a run*,
+*recording*, or the error) and the current value of each of its signals. Before
+this, seeing a number meant opening the identify dialog, which is a strange
+place to go to answer "is the oven at temperature yet".
+
+Settings a device cannot have are hidden rather than left blank: a device read
+from its own software is addressed in its own dialog, and four empty fields made
+a working one look misconfigured. The actions used once per instrument live
+behind **Set up ▾**, leaving the two that get pressed during a run.
+
+**View → Dark theme** switches the window and the chart, and is remembered.
+
 ## Watching two instruments at once
 
 Press **Add another device**. Each gets its own panel — name, address, adapter,
