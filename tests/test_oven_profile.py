@@ -76,9 +76,7 @@ def feed(exchanges):
             s_seq += len(reply)
     decoder = LiveDecoder(profile())
     samples = decoder.feed(chunks)
-    tail = decoder.flush()
-    if tail is not None:
-        samples.append(tail)
+    samples.extend(decoder.flush())
     return samples
 
 
@@ -178,3 +176,84 @@ def test_the_protective_gas_channel_is_flagged_as_positional():
     notes = profile().notes
     assert "position rather than by evidence" in notes
     assert "not a measurement" in notes
+
+
+# ----- replies that carry more than one reading ------------------------------
+
+
+def batch(records, header=bytes.fromhex("000800010001")):
+    """A reply holding `records` readings, the way the oven packs them.
+
+    43 bytes for the first, then 37 for each of the rest, with no header
+    between them - which is what makes a naive decoder read the first and
+    silently discard the others.
+    """
+    out = bytearray(header)
+    for i, sample in enumerate(records):
+        out += bytes.fromhex("0305000328") + bytes([43, i * 10]) + b"\x00\x00"
+        out += b"".join(
+            struct.pack(">f", v)
+            for v in (sample, 21.0, 20287.716797, 28.81, 5.0, 20.0, 0.0)
+        )
+    return bytes(out)
+
+
+def test_a_batched_reply_yields_every_reading_not_just_the_first():
+    """The instrument buffers when the software logs faster than it polls.
+
+    A decoder that reads only the first record records a tenth of the
+    experiment and gives no sign that the rest existed - the readings it does
+    keep are perfectly correct.
+    """
+    wanted = [21.1, 21.2, 21.3, 21.4, 21.5, 21.6, 21.7, 21.8, 21.9, 22.0]
+    reply = batch(wanted)
+    assert len(reply) == 376, f"ten records should be 376 bytes, got {len(reply)}"
+
+    samples = feed([(float(i), STATUS_REQ, reply) for i in range(3)])
+    got = [s.values["sample_temperature"] for s in samples]
+    # The first batch contributes its newest reading only; the two after it
+    # contribute all ten each.
+    assert len(got) == 21, f"expected ten readings per reply, got {len(got)}"
+    # The profile adds Calisto's +3.000 to every one of them.
+    assert [round(v - 3.0, 4) for v in got[1:11]] == wanted
+
+
+def test_readings_in_a_batch_are_spread_across_the_interval_they_cover():
+    """All ten sharing the reply's timestamp would stack them on one instant."""
+    reply = batch([21.0 + i * 0.1 for i in range(10)])
+    samples = feed([(float(i), STATUS_REQ, reply) for i in range(3)])
+    # The first batch contributes only its newest reading: there is no earlier
+    # reply to measure the interval against, so the other nine have no known
+    # time. Every batch after it is spread across the second it covers.
+    later = [s for s in samples if s.ts > 1.0]
+    stamps = sorted(round(s.ts, 6) for s in later)
+    assert len(set(stamps)) == len(later), "every reading needs its own timestamp"
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert max(gaps) - min(gaps) < 0.02, f"spacing should be even, got {gaps}"
+    assert abs(max(gaps) - 0.1) < 0.02, f"ten readings in a second, got {max(gaps)}"
+
+
+def test_a_reply_that_does_not_divide_into_records_falls_back_to_one():
+    """Two replies concatenated put a second header in the middle.
+
+    Every record after it shifts, and reading straight through produces
+    plausible-looking numbers that are wrong. Losing the batch costs a fraction
+    of a second; emitting it wrong costs more, and silently.
+    """
+    damaged = batch([21.0] * 5) + bytes.fromhex("000800010001") + batch([99.0] * 3)[6:]
+    assert (len(damaged) - 6) % 37 != 0, "this fixture must be unaligned"
+
+    samples = feed([(float(i), STATUS_REQ, damaged) for i in range(3)])
+    for s in samples:
+        # 99.0 would be a record read across the second header.
+        assert abs(s.values["sample_temperature"] - 24.0) < 1e-4
+        assert abs(s.values["heat_flow"] - 20287.716797) < 1e-3
+
+
+def test_a_signal_without_a_stride_is_not_repeated_into_later_records():
+    """It has one reading per reply; copying it would invent samples."""
+    request = bytes.fromhex("000100140002")
+    reply = request + struct.pack(">f", 1525.0)
+    samples = feed([(float(i), request, reply) for i in range(4)])
+    assert all("carrying_gas_pressure" in s.values for s in samples)
+    assert len(samples) == 4, f"one reading per reply, got {len(samples)}"

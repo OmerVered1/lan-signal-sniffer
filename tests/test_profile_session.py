@@ -98,9 +98,7 @@ def test_live_decoder_recovers_the_transmitted_signal():
     profile, chunks = c80_profile()
     decoder = LiveDecoder(profile)
     samples = decoder.feed(chunks)
-    tail = decoder.flush()
-    if tail:
-        samples.append(tail)
+    samples.extend(decoder.flush())
 
     heat = [s.values["heat_flow"] for s in samples if "heat_flow" in s.values]
     assert len(heat) == 120

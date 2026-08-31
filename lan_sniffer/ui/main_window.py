@@ -1060,9 +1060,9 @@ class MainWindow(QMainWindow):
 
     def _close_session(self, manual: bool = False) -> None:
         for monitor in self._monitors:
-            tail = monitor.flush()
-            if tail is not None and self._csv is not None:
-                self._csv.add(tail.ts, tail.values)
+            for tail in monitor.flush():
+                if self._csv is not None:
+                    self._csv.add(tail.ts, tail.values)
         if self._csv is not None:
             rows = self._csv.rows_written
             named = bool(self._csv.signal_names)

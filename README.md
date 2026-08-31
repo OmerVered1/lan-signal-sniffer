@@ -429,7 +429,24 @@ the panel reads at idle. What ties the family together is its neighbour
 a median difference of 0.000000 — so `00010014xxxx` is the gas panel, and its
 four indices are the four things Calisto groups there.
 
-Three things about it are worth knowing, because all three are traps:
+**Its replies are not one reading each.** When Calisto logs faster than it
+polls — 10 Hz against a 1 Hz poll — the instrument answers with every reading
+taken since the last request, packed back to back: 43 bytes for the first, then
+37 for each of the rest with no header between them. A decoder that reads only
+the first record keeps a tenth of the experiment and gives no sign of it,
+because the readings it does keep are perfectly correct. Hence `stride` on a
+signal, and `record_base` so a reply that does not divide exactly into records
+falls back to its first one rather than reading across a second header and
+emitting plausible numbers that are wrong.
+
+Verified against a 10 Hz run: every signal matches Calisto on 99.3–100% of
+samples, RMSE **0.00027 °C**. That comparison needs the *export* shifted by
+−2.40 s, and the shift belongs to the export — a Calisto table holds elapsed
+seconds from a `Zone Start Time` written to the whole second, so its own clock
+is uncertain by a second or two while the capture's is not. Sniffed timestamps
+are the better of the two.
+
+Four things about it are worth knowing, because all four are traps:
 
 * That channel answers in **two shapes** — a 6-byte "nothing new" ack and the
   full frame — and the ack is the more common of the two (29,723 against

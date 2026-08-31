@@ -247,16 +247,21 @@ class DeviceMonitor:
         """Let a quiet period close a run, for devices without a stop command."""
         return self.detector.tick(now) if self.detector is not None else None
 
-    def flush(self) -> Optional[Sample]:
-        """Complete the reply still in hand when a session ends."""
+    def flush(self) -> List[Sample]:
+        """Complete the reply still in hand when a session ends.
+
+        A list: the final reply can hold a batch of readings, and there is no
+        next poll to pick up whatever a single return value would leave behind.
+        """
         if self.decoder is None:
-            return None
-        tail = self.decoder.flush()
-        if tail is None:
-            return None
-        return Sample(
-            ts=tail.ts, values={self.qualify(k): v for k, v in tail.values.items()}
-        )
+            return []
+        return [
+            Sample(
+                ts=tail.ts,
+                values={self.qualify(k): v for k, v in tail.values.items()},
+            )
+            for tail in self.decoder.flush()
+        ]
 
     def iter_requests(self, chunks: List[StreamChunk]) -> Iterator[Tuple[float, bytes]]:
         """Split client segments into whole request frames, carrying partials."""

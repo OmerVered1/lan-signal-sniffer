@@ -23,7 +23,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..capture.reassembly import C2S, S2C, StreamChunk
 from ..readers.modbus import FORMATS as MODBUS_FORMATS, RegisterSpec
-from .fields import decode_field
+from .fields import ENCODINGS, decode_field
 from .framer import FramingSpec, TimedStream, apply_mask, split_frames
 
 PROFILE_VERSION = 2
@@ -31,6 +31,10 @@ PROFILE_VERSION = 2
 # Where a device's values come from.
 SOURCE_SNIFF = "sniff"    # watch the vendor software's traffic, decode replies
 SOURCE_MODBUS = "modbus"  # ask the instrument's own Modbus slave for them
+
+
+# Byte width of each encoding, for working out how many records fit in a reply.
+_ENC_WIDTH: Dict[str, int] = {name: size for name, _dt, size, _f in ENCODINGS}
 
 
 @dataclass
@@ -45,6 +49,20 @@ class SignalSpec:
     encoding: str
     scale: float = 1.0
     bias: float = 0.0
+    # Bytes from one record of this field to the next inside a single reply.
+    # Zero means one reading per reply, which is the ordinary case.
+    #
+    # Some instruments buffer. When the software logs faster than it polls, the
+    # instrument answers with every reading taken since the last request, packed
+    # back to back. A Setaram oven logging at 10 Hz and polled at 1 Hz replies
+    # with ten records in one frame, and a decoder that reads only the first
+    # throws nine tenths of the experiment away without any sign that it did.
+    stride: int = 0
+    # Bytes before the first record - the reply's own header. Only meaningful
+    # alongside a stride, and what makes it possible to tell a clean batch from
+    # a damaged one: a whole number of records must fit between the header and
+    # the end of the reply.
+    record_base: int = 0
 
     def matches(self, request: bytes) -> bool:
         if len(request) != len(self.signature):
@@ -66,7 +84,39 @@ class SignalSpec:
             "encoding": self.encoding,
             "scale": self.scale,
             "bias": self.bias,
+            "stride": self.stride,
+            "record_base": self.record_base,
         }
+
+    def width(self) -> int:
+        """Bytes this field occupies, for working out how many records fit."""
+        if self.encoding.startswith("ascii"):
+            return 0
+        return _ENC_WIDTH.get(self.encoding, 0)
+
+    def record_count(self, payload_len: int) -> int:
+        """How many readings of this field a reply of this length carries.
+
+        A batch is only read as a batch when the reply divides exactly into
+        records. Two replies concatenated - which happens when a request goes
+        unseen and the pairing lumps the answers together - put a second header
+        in the middle and shift every record after it, and reading straight
+        through produces plausible-looking numbers that are wrong. So an
+        unaligned reply falls back to its first record, which is the one that
+        is always where it claims to be.
+
+        Losing the rest costs a fraction of a second of a run. Emitting them
+        wrong costs more than that, and silently.
+        """
+        if self.stride <= 0:
+            return 1
+        if self.offset + self.width() > payload_len:
+            return 0
+        if self.record_base or self.record_base == 0:
+            span = payload_len - self.record_base
+            if span > 0 and span % self.stride == 0:
+                return span // self.stride
+        return 1
 
     @classmethod
     def from_dict(cls, d: dict) -> "SignalSpec":
@@ -79,6 +129,8 @@ class SignalSpec:
             encoding=d["encoding"],
             scale=float(d.get("scale", 1.0)),
             bias=float(d.get("bias", 0.0)),
+            stride=int(d.get("stride", 0)),
+            record_base=int(d.get("record_base", 0)),
         )
 
 
@@ -432,6 +484,9 @@ class LiveDecoder:
         self._pending_ts: float = 0.0
         self._response = bytearray()
         self._carry = bytearray()  # request bytes split across segments
+        # When each request last got an answer, so a batch of records can be
+        # spread across the interval it actually covers.
+        self._last_reply: Dict[bytes, float] = {}
 
     @property
     def _is_push(self) -> bool:
@@ -454,9 +509,7 @@ class LiveDecoder:
                 self._carry.clear()
 
             for frame in self._frames_in(chunk):
-                done = self._close_pending()
-                if done is not None:
-                    samples.append(done)
+                samples.extend(self._close_pending())
                 self._pending_request = frame
                 self._pending_ts = chunk.ts
                 self._response.clear()
@@ -497,16 +550,21 @@ class LiveDecoder:
             del self._carry[:consumed]
         return samples
 
-    def flush(self) -> Optional[Sample]:
-        """Complete the outstanding sample, if any, and clear state."""
+    def flush(self) -> List[Sample]:
+        """Complete the outstanding reply, if any, and clear state.
+
+        A list, because the last reply of a session can carry a whole batch of
+        readings and returning only the newest would drop the rest at exactly
+        the moment there is no next poll to recover them.
+        """
         if self._is_push:
             self._carry.clear()
-            return None
-        sample = self._close_pending()
+            return []
+        samples = self._close_pending()
         self._pending_request = None
         self._response.clear()
         self._carry.clear()
-        return sample
+        return samples
 
     # ----- internals ----------------------------------------------------
 
@@ -532,22 +590,69 @@ class LiveDecoder:
         del self._carry[:consumed]
         return [f.data for f in frames]
 
-    def _decode(self, payload: bytes, request: bytes) -> Dict[str, float]:
-        values: Dict[str, float] = {}
-        for spec in self._profile.signals_for(request):
-            raw = decode_field([payload], spec.offset, spec.encoding)[0]
-            if raw == raw:  # not NaN
-                values[spec.name] = spec.convert(float(raw))
-        return values
+    def _decode(self, payload: bytes, request: bytes) -> List[Dict[str, float]]:
+        """Decode every reading this reply carries, oldest first.
 
-    def _close_pending(self) -> Optional[Sample]:
+        Usually one. An instrument that logs faster than it is polled answers
+        with all the readings taken since the last request, packed back to back,
+        and a signal marked with a stride says how far apart they sit.
+        """
+        specs = list(self._profile.signals_for(request))
+        if not specs:
+            return []
+        records = max((spec.record_count(len(payload)) for spec in specs), default=1)
+        out: List[Dict[str, float]] = []
+        for index in range(max(records, 1)):
+            values: Dict[str, float] = {}
+            for spec in specs:
+                if index and index >= spec.record_count(len(payload)):
+                    # A signal without a stride has one reading per reply; it
+                    # belongs to the first record and must not be repeated into
+                    # the rest, which would invent samples it never reported.
+                    continue
+                offset = spec.offset + index * spec.stride
+                raw = decode_field([payload], offset, spec.encoding)[0]
+                if raw == raw:  # not NaN
+                    values[spec.name] = spec.convert(float(raw))
+            if values:
+                out.append(values)
+        return out
+
+    def _close_pending(self) -> List[Sample]:
+        """Finish the outstanding reply, as one sample or as many.
+
+        Batched records are spread across the interval since this channel last
+        answered, ending at the reply itself. The instrument stamps each record
+        with its own time, but only to the second within the minute, so the
+        capture clock plus even spacing is both simpler and no less accurate
+        than reconstructing an absolute time from a partial one.
+        """
         if self._pending_request is None or not self._response:
-            return None
-        values = self._decode(bytes(self._response), self._pending_request)
+            return []
+        payload = bytes(self._response)
+        request = self._pending_request
+        rows = self._decode(payload, request)
         self._response.clear()
-        if not values:
-            return None
-        return Sample(ts=self._pending_ts, values=values)
+        if not rows:
+            return []
+
+        end = self._pending_ts
+        previous = self._last_reply.get(request)
+        self._last_reply[request] = end
+        if len(rows) == 1:
+            return [Sample(ts=end, values=rows[0])]
+        if previous is None or end <= previous:
+            # The first batch on a channel has nothing to measure the interval
+            # against, so only its newest reading has a time that is actually
+            # known. Stacking the rest on that same instant would put readings
+            # at times they were not taken, which is worse than not having
+            # them; it costs under a second, once per channel per session.
+            return [Sample(ts=end, values=rows[-1])]
+        step = (end - previous) / len(rows)
+        return [
+            Sample(ts=end - (len(rows) - 1 - i) * step, values=row)
+            for i, row in enumerate(rows)
+        ]
 
 
 def build_profile(

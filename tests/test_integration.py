@@ -46,9 +46,7 @@ def test_shipped_c80_profile_decodes_c80_traffic():
     samples = decoder.feed(synth.c80_capture(n_cycles=30))
     # A reply is only complete once the next request goes out, so the final
     # sample is still held when the capture ends.
-    tail = decoder.flush()
-    if tail:
-        samples.append(tail)
+    samples.extend(decoder.flush())
 
     heat = [s.values["heat_flow"] for s in samples if "heat_flow" in s.values]
     temp = [
@@ -141,8 +139,7 @@ def test_the_recorded_csv_matches_what_was_transmitted(tmp_path):
     with SessionCSVWriter(path, profile.signal_names, units) as writer:
         for sample in decoder.feed(chunks):
             writer.add(sample.ts, sample.values)
-        tail = decoder.flush()
-        if tail:
+        for tail in decoder.flush():
             writer.add(tail.ts, tail.values)
 
     rows = read_csv(path)
