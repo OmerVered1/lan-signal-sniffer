@@ -118,7 +118,7 @@ def summarise(reply: bytes) -> str:
     if not reply:
         return "no reply"
     head = reply[:32].hex()
-    tail = f" … ({len(reply)} bytes)" if len(reply) > 32 else f" ({len(reply)} bytes)"
+    tail = f" ... ({len(reply)} bytes)" if len(reply) > 32 else f" ({len(reply)} bytes)"
     return head + tail
 
 
@@ -153,7 +153,7 @@ def cmd_list(args) -> int:
         by_opcode.setdefault(request.opcode, []).append(request)
     for opcode in sorted(by_opcode):
         group = by_opcode[opcode]
-        print(f"opcode 0x{opcode:02x} — {len(group)} request(s)")
+        print(f"opcode 0x{opcode:02x} - {len(group)} request(s)")
         for request in group:
             print(f"  {request.describe()}")
             print(f"    {request.payload.hex()}")
@@ -172,7 +172,7 @@ def _connected(args):
             file=sys.stderr,
         )
         return None
-    print(f"connecting to {args.host}:{args.port} …")
+    print(f"connecting to {args.host}:{args.port} ...")
     return Probe(args.host, args.port, timeout_s=args.timeout)
 
 
@@ -208,7 +208,7 @@ def cmd_sweep(args) -> int:
     if template is None:
         print(
             f"{args.request} is not a request this capture recorded.\n"
-            "Only observed requests can be swept — run `list` to see them.",
+            "Only observed requests can be swept - run `list` to see them.",
             file=sys.stderr,
         )
         return 2
@@ -263,7 +263,7 @@ def main() -> int:
                            help="seconds between requests")
         p.add_argument("--device", help="which instrument, when the capture holds two")
         p.add_argument("--include-one-offs", action="store_true",
-                       help="also use requests sent only once — these may be writes")
+                       help="also use requests sent only once - these may be writes")
 
     listing = sub.add_parser("list", help="show the requests, without connecting")
     common(listing, False)

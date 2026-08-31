@@ -101,10 +101,14 @@ jobs:
       - name: Check it runs and finds its bundled request list
         shell: pwsh
         run: |
-          $out = & ".\probe-analyser.exe" list max300_requests
+          # -join first: PowerShell returns output as an array of lines, and
+          # `-notmatch` on an array filters it rather than answering yes or no,
+          # so a non-empty array of non-matching lines reads as true and the
+          # check fails on output that was perfectly correct.
+          $out = (& ".\probe-analyser.exe" list max300_requests) -join "`n"
           if ($LASTEXITCODE -ne 0) { throw "probe-analyser exited $LASTEXITCODE" }
           if ($out -notmatch "distinct request") { throw "unexpected output: $out" }
-          Write-Host ($out | Select-Object -First 1)
+          Write-Host ($out -split "`n" | Select-Object -First 1)
 
       - name: Also package the plain folder build
         shell: pwsh
