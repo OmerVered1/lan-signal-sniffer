@@ -305,3 +305,24 @@ def test_a_reset_makes_the_next_reply_the_new_history():
     assert len(c.poll()) == 1
     c.reset()
     assert c.poll() == [], "after a reset the next reply is history again"
+
+
+def test_a_test_read_shows_what_came_back_even_on_the_first_look():
+    """`poll` drops the first reply as history; a diagnostic must not.
+
+    Someone checking whether this works looks once. If that look is always
+    empty, a working endpoint reads as a broken one.
+    """
+    c = client_with([], prime=False)
+    c.transport = FakeTransport([REAL])
+    got = c.latest()
+    assert len(got) == 1
+    assert got[0].values["V1_C_O2"] == pytest.approx(73.241630554199)
+    assert c.poll() == [], "and it must not have consumed the history boundary"
+
+
+def test_a_test_read_raises_the_reason_rather_than_going_quiet():
+    c = client_with([], prime=False)
+    c.transport = FakeTransport([RuntimeError("HTTP 401 Unauthorized")])
+    with pytest.raises(RuntimeError, match="401"):
+        c.latest()

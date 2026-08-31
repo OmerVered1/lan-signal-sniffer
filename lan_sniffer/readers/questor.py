@@ -372,6 +372,22 @@ class QuestorClient:
             self._seen = set(sorted(self._seen, key=lambda k: k[1])[-1024:])
         return fresh
 
+    def latest(self) -> List[ResultSet]:
+        """One request, parsed, with none of the recording rules applied.
+
+        `poll` exists to feed a session, so it drops the first reply as history
+        and never repeats a result. Neither is right for someone checking
+        whether the thing answers at all - a single look would come back empty
+        every time and read as a broken connection.
+
+        Raises rather than reporting through `last_error`, because a caller
+        asking "does this work" wants the reason, not a quiet empty list.
+        """
+        if self.transport is None:
+            self.open()
+        payload = self.transport.post(self.url, build_request(self.count), self.timeout_s)
+        return parse_results(payload)
+
     def status(self) -> str:
         if self.last_error:
             return f"Questor: {self.last_error}"

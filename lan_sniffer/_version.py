@@ -6,7 +6,7 @@ in-app updater compares the tag against this string. If the two disagree,
 the app will offer an update to a version it is already running.
 """
 
-__version__ = "0.15.2"
+__version__ = "0.15.3"
 __app_name__ = "LAN Signal Sniffer"
 __author__ = "Omer Vered"
 

@@ -129,10 +129,11 @@ class QuestorSetupDialog(QDialog):
             )
             return
 
-        results = client.poll()
-        if client.last_error:
+        try:
+            results = client.latest()
+        except Exception as e:
             self._output.setPlainText(
-                f"{client.url}\n\nThe request failed:\n\n{client.last_error}"
+                f"{client.url}\n\nThe request failed:\n\n{e}"
             )
             return
         if not results:
