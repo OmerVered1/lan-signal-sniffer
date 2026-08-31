@@ -156,3 +156,64 @@ def test_a_refused_connection_is_an_error_not_a_crash():
     sock.close()  # nothing is listening now
     with pytest.raises(OSError):
         Probe("127.0.0.1", port, timeout_s=0.3).open()
+
+
+# ----- the greeting a connection starts with ---------------------------------
+
+
+def capture_with_greeting(greeting=(b"HELLO\x01", b"\x02SESSION")):
+    """A connection whose first frames are a handshake, then normal polling."""
+    asm = TCPReassembler("172.16.0.1")
+    chunks = []
+    c_seq = s_seq = 1000
+    t = 0.0
+    for frame in greeting:
+        chunks += asm.add_segment(
+            t, synth.PEER_IP, 51234, "172.16.0.1", 30000, c_seq, frame
+        )
+        c_seq += len(frame)
+        chunks += asm.add_segment(
+            t + 0.01, "172.16.0.1", 30000, synth.PEER_IP, 51234, s_seq, b"\x06"
+        )
+        s_seq += 1
+        t += 0.5
+    for _ in range(40):
+        chunks += asm.add_segment(
+            t, synth.PEER_IP, 51234, "172.16.0.1", 30000, c_seq, POLL
+        )
+        c_seq += len(POLL)
+        chunks += asm.add_segment(
+            t + 0.01, "172.16.0.1", 30000, synth.PEER_IP, 51234, s_seq, b"\xaa" * 24
+        )
+        s_seq += 24
+        t += 1.0
+    return chunks
+
+
+def test_the_opening_frames_of_a_connection_are_recovered():
+    """Sent once per connection, so nothing that counts repeats will see them."""
+    from lan_sniffer.readers.probe import opening_sequence
+
+    greeting = opening_sequence(capture_with_greeting(), "172.16.0.1")
+    assert greeting[:2] == [b"HELLO\x01", b"\x02SESSION"]
+
+
+def test_a_greeting_is_not_invented_when_the_capture_joined_late():
+    """A capture that began mid-conversation has no byte zero.
+
+    Returning the first thing it happens to see would hand back an ordinary
+    poll dressed as a handshake, and replaying that proves nothing.
+    """
+    from lan_sniffer.readers.probe import opening_sequence
+
+    chunks = capture_with_greeting()
+    # Drop everything from the start of the stream, as a late capture would.
+    late = [c for c in chunks if c.stream_offset > 200]
+    assert opening_sequence(late, "172.16.0.1") == []
+
+
+def test_the_greeting_is_not_mistaken_for_a_poll():
+    """It is sent once, so it must not appear in the replayable request list."""
+    found = {r.payload for r in observed_requests(capture_with_greeting()) if r.is_poll}
+    assert POLL in found
+    assert b"HELLO\x01" not in found

@@ -294,6 +294,21 @@ what comes back; `sweep` varies a single 32-bit field of one observed request
 through an address range, which is how you find out whether the instrument holds
 something its own software never asks for.
 
+**An instrument can accept a connection and then say nothing at all.** The
+MAX300 does exactly that: it took the connection and ignored all 51 requests.
+The likely reason is a greeting — a login, a protocol version, a session open —
+sent once when the vendor software first connects. Something sent once per
+connection is invisible to anything looking for repeated polls, and absent
+entirely from a capture that began while the software was already connected.
+
+So `replay` and `sweep` open with the connection's first frames when the
+capture recorded them, and say plainly when it did not. Recovering a greeting
+needs a capture that **starts before the vendor software does** — what
+identifies it is byte zero of the client-to-server stream, and a capture that
+joined an existing conversation has no byte zero to offer. The tool will not
+substitute the first thing it happens to see, because replaying an ordinary
+poll dressed as a handshake proves nothing.
+
 Three rules keep it honest:
 
 * **Nothing is invented.** Every request sent is one the capture recorded, or

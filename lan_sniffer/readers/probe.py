@@ -117,6 +117,46 @@ def observed_requests(
     return sorted(found.values(), key=lambda r: -r.count)
 
 
+def opening_sequence(
+    chunks: Sequence[StreamChunk], device_ip: str = "", limit_bytes: int = 4096
+) -> List[bytes]:
+    """The first thing the vendor software says on a fresh connection.
+
+    An instrument can accept a TCP connection and then answer nothing at all
+    until it has been greeted — a login, a protocol version, a session open.
+    That greeting is sent once per connection, so it is invisible to anything
+    that looks for repeated polls, and it is missing entirely from a capture
+    that began while the software was already connected.
+
+    Recognising it needs a capture that starts *before* the vendor software
+    does. What identifies it is the stream offset: byte zero of the
+    client-to-server direction is the first thing ever said on that connection,
+    whatever it turns out to mean.
+
+    Returns the opening client frames in order, or an empty list when the
+    capture joined a conversation already in progress — which is not the same
+    answer as "there is no handshake", and the caller has to say so.
+    """
+    wanted = [
+        c
+        for c in chunks
+        if c.direction == C2S
+        and (not device_ip or c.device_ip in ("", device_ip))
+        and c.stream_offset < limit_bytes
+    ]
+    if not any(c.stream_offset == 0 for c in wanted):
+        return []
+    wanted.sort(key=lambda c: (c.stream_offset, c.ts))
+    out: List[bytes] = []
+    seen = set()
+    for chunk in wanted:
+        if chunk.stream_offset in seen:
+            continue
+        seen.add(chunk.stream_offset)
+        out.append(chunk.data)
+    return out
+
+
 @dataclass
 class ProbeReply:
     request: bytes

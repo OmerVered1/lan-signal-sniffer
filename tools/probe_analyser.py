@@ -45,6 +45,7 @@ from lan_sniffer.readers.probe import (  # noqa: E402
     ObservedRequest,
     Probe,
     observed_requests,
+    opening_sequence,
 )
 from lan_sniffer.writers.raw_writer import read_raw  # noqa: E402
 
@@ -130,6 +131,7 @@ def cmd_list(args) -> int:
                 {
                     "source": resolve_source(args.capture).name,
                     "device": args.device or "",
+                    "handshake": [f.hex() for f in _handshake(args)],
                     "requests": [
                         {
                             "request": r.payload.hex(),
@@ -176,14 +178,40 @@ def _connected(args):
     return Probe(args.host, args.port, timeout_s=args.timeout)
 
 
+def _handshake(args):
+    """The opening frames of the connection, if the capture recorded them."""
+    source = resolve_source(args.capture)
+    if source.suffix == ".json":
+        saved = json.loads(source.read_text(encoding="utf-8"))
+        return [bytes.fromhex(h) for h in saved.get("handshake", [])]
+    return opening_sequence(list(read_raw(source)), args.device or "")
+
+
 def cmd_replay(args) -> int:
     found = load(args)
+    greeting = _handshake(args)
     probe = _connected(args)
     if probe is None:
         return 2
     print(f"replaying {len(found)} request(s) the software was seen to send\n")
     answered = 0
     with probe:
+        if greeting and not args.no_handshake:
+            print(f"opening with the {len(greeting)} frame(s) the software "
+                  "sends on a fresh connection:")
+            for frame in greeting:
+                reply = probe.ask(frame)
+                print(f"   {frame.hex()[:48]:<48} {summarise(reply.reply)}")
+                time.sleep(max(args.interval, MIN_INTERVAL_S))
+            print()
+        elif not greeting:
+            print(
+                "NOTE: this capture has no connection opening in it - it began\n"
+                "while the vendor software was already connected. If the\n"
+                "instrument answers nothing below, that is the likely reason:\n"
+                "record a capture that starts BEFORE the software does, so the\n"
+                "greeting is on tape.\n"
+            )
         for request in found:
             reply = probe.ask(request.payload)
             mark = "ok " if reply.ok else "-- "
@@ -226,7 +254,13 @@ def cmd_sweep(args) -> int:
         f"The capture's own answer to this request was {baseline} bytes.\n"
     )
     novel = 0
+    greeting = _handshake(args)
     with probe:
+        if greeting and not args.no_handshake:
+            for frame in greeting:
+                probe.ask(frame)
+                time.sleep(max(args.interval, MIN_INTERVAL_S))
+            print(f"(opened with {len(greeting)} handshake frame(s))\n")
         for value in values:
             request = template.with_word(args.word, value)
             reply = probe.ask(request)
@@ -261,6 +295,8 @@ def main() -> int:
             p.add_argument("--timeout", type=float, default=3.0)
             p.add_argument("--interval", type=float, default=0.05,
                            help="seconds between requests")
+            p.add_argument("--no-handshake", action="store_true",
+                           help="skip the connection opening, if one was recorded")
         p.add_argument("--device", help="which instrument, when the capture holds two")
         p.add_argument("--include-one-offs", action="store_true",
                        help="also use requests sent only once - these may be writes")
