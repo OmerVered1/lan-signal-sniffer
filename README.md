@@ -134,7 +134,35 @@ from its own software is addressed in its own dialog, and four empty fields made
 a working one look misconfigured. The actions used once per instrument live
 behind **Set up ▾**, leaving the two that get pressed during a run.
 
+**Hover the chart** and a crosshair crosses every panel with the value of each
+visible curve at that instant, and the elapsed time. A chart that shows a peak
+but cannot say how big it is sends you to the CSV to answer a question you are
+already looking at.
+
+**Show** limits the view to the last 2 minutes, 10 minutes or hour. Thirteen
+hours drawn at once is a compressed smear and the part worth watching is
+usually the end of it. Nothing is discarded — this only changes the view.
+
 **View → Dark theme** switches the window and the chart, and is remembered.
+
+The recording controls stay put while the device list scrolls: a third
+instrument used to push *Start session* off the bottom of the window, which is
+the one control that has to be reachable when a run is about to begin. And the
+capture warning is one line that appears only when capture cannot work — it
+used to be three lines of orange above everything, permanently, including on a
+machine where capture was working.
+
+### Naming a session
+
+**Save next as** sets the file name for the next session — one started by hand
+and one the instrument starts on its own. Those unattended runs are exactly the
+ones a name is worth having, and exactly the ones nobody is at the keyboard for.
+
+Left blank, the name is built from the profile and the clock, which is right for
+a long unattended run and wrong for the third repeat of one condition, where a
+name is the only thing that will still mean something next week. The file that
+will be written is shown before it is, and a repeated name never overwrites the
+last one — a counter is added instead.
 
 ## Watching two instruments at once
 

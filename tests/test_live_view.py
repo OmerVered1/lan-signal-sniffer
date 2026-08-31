@@ -154,3 +154,70 @@ def test_switching_theme_keeps_the_signals(qapp):
     view.set_theme(dark=True)
     assert len(view._curves) == 2
     assert view._theme.dark
+
+
+# ----- the time window -------------------------------------------------------
+
+
+def test_the_window_trims_the_view_and_keeps_the_data(qapp):
+    """Thirteen hours drawn at once is a smear; the data is still all there."""
+    view = LiveView()
+    view.set_signals(["t"], {"t": "degC"})
+    for i in range(1000):
+        view.add(float(i), {"t": 20.0 + i})
+    view._window.setCurrentIndex(0)  # 2 minutes
+    view.redraw()
+    drawn, _ = view._curves["t"].getData()
+    assert len(drawn) <= 121, len(drawn)
+    assert drawn[-1] == 999.0, "the newest point is what you want to see"
+    assert len(view._values["t"]) == 1000, "nothing may be discarded"
+
+
+def test_showing_all_draws_everything(qapp):
+    view = LiveView()
+    view.set_signals(["t"], {"t": "degC"})
+    for i in range(300):
+        view.add(float(i), {"t": 20.0 + i})
+    view._window.setCurrentIndex(len(view._window) - 1)
+    view.redraw()
+    drawn, _ = view._curves["t"].getData()
+    assert len(drawn) == 300
+
+
+# ----- the crosshair ---------------------------------------------------------
+
+
+def test_the_cursor_reads_the_curves_at_a_moment(qapp):
+    """A chart that shows a peak but cannot say how big it is is half a tool."""
+    view = LiveView()
+    view.set_signals(["t", "p"], {"t": "degC", "p": "%"})
+    for i in range(100):
+        view.add(float(i), {"t": 20.0 + i, "p": 5.0})
+    text = view._read_at(42.0)
+    assert "42.0 s" in text
+    assert "62.000" in text, text
+    assert "degC" in text
+
+
+def test_a_hidden_curve_is_not_read_out(qapp):
+    view = LiveView()
+    view.set_signals(["t", "p"], {"t": "degC", "p": "%"})
+    for i in range(20):
+        view.add(float(i), {"t": 20.0 + i, "p": 5.0})
+    view._boxes["p"].setChecked(False)
+    assert "p</span>" not in view._read_at(10.0)
+
+
+def test_the_cursor_says_nothing_past_the_end_of_the_run(qapp):
+    """Holding the last value would read as a measurement that continued."""
+    from lan_sniffer.ui.live_view import _nearest
+
+    assert _nearest([0.0, 1.0, 2.0], 1.4) == 1
+    assert _nearest([0.0, 1.0, 2.0], 90.0) is None
+    assert _nearest([], 1.0) is None
+
+
+def test_every_panel_gets_a_crosshair(qapp):
+    view = LiveView()
+    view.set_signals(["t", "p"], {"t": "degC", "p": "%"})
+    assert len(view._crosshairs) == len(view._panels) == 2

@@ -103,6 +103,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_menu()
+        self._show_next_name()
         self._check_readiness()
         for monitor in self._monitors:
             self._add_form(monitor)
@@ -280,6 +281,12 @@ class MainWindow(QMainWindow):
         self._readiness = QLabel()
         self._readiness.setWordWrap(True)
         self._readiness.setTextFormat(Qt.RichText)
+        self._readiness_detail = ""
+        self._readiness.linkActivated.connect(
+            lambda _: QMessageBox.information(
+                self, "Capture", self._readiness_detail or "Capture is available."
+            )
+        )
 
         # Every device gets its own visible panel. A dropdown that swapped one
         # shared form between them hid the device you were not looking at,
@@ -299,7 +306,7 @@ class MainWindow(QMainWindow):
         self._session_label.setWordWrap(True)
         self._session_label.setTextFormat(Qt.RichText)
         self._session_label.setStyleSheet(_muted_style(self._dark))
-        self._session_label.setMinimumHeight(46)
+        self._session_label.setMinimumHeight(32)
 
         self._start_btn = QPushButton("Start session")
         self._stop_btn = QPushButton("Stop session")
@@ -318,35 +325,68 @@ class MainWindow(QMainWindow):
         choose_dir = QPushButton("Change folder\u2026")
         choose_dir.clicked.connect(self._choose_output_dir)
 
+        # A name for the next session, whether it is started by hand or by the
+        # instrument. Left blank the name is built from the profile and the
+        # clock, which is right for a long unattended run and wrong for the
+        # third repeat of one condition, where a name is the only thing that
+        # will still mean anything next week.
+        self._next_name = QLineEdit()
+        self._next_name.setPlaceholderText("(automatic)")
+        self._next_name.setToolTip(
+            "The file name for the next session. Applies to a session started\n"
+            "by hand and to one the instrument starts on its own.\n\n"
+            "A run with the same name never overwrites the last: a counter is\n"
+            "added instead."
+        )
+        self._next_name.textChanged.connect(self._show_next_name)
+        self._name_preview = QLabel()
+        self._name_preview.setStyleSheet(_muted_style(self._dark))
+        self._name_preview.setWordWrap(True)
+
+        naming = QFormLayout()
+        naming.setContentsMargins(0, 0, 0, 0)
+        naming.addRow("Save next as", self._next_name)
+
         session_group = QGroupBox("Recording")
         session = QVBoxLayout(session_group)
         session.addWidget(self._banner)
         session.addWidget(self._session_label)
-        session.addWidget(self._start_btn)
-        session.addWidget(self._stop_btn)
-        session.addWidget(self._split_btn)
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        for button in (self._start_btn, self._stop_btn, self._split_btn):
+            buttons.addWidget(button)
+        session.addLayout(buttons)
+        session.addLayout(naming)
+        session.addWidget(self._name_preview)
         session.addWidget(self._output_label)
         session.addWidget(choose_dir)
 
         inner = QWidget()
-        side_layout = QVBoxLayout(inner)
+        device_column = QVBoxLayout(inner)
+        device_column.setContentsMargins(0, 0, 0, 0)
+        device_column.addLayout(self._device_area)
+        device_column.addWidget(self._add_device_btn)
+        device_column.addStretch(1)
+
+        # Only the devices scroll. They are what grows - a third instrument
+        # pushed Start session off the bottom of the window, which is the one
+        # control that must be reachable while a run is about to begin.
+        devices = QScrollArea()
+        devices.setWidget(inner)
+        devices.setWidgetResizable(True)
+        devices.setFrameShape(QScrollArea.NoFrame)
+
+        side = QWidget()
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.addWidget(self._readiness)
-        side_layout.addLayout(self._device_area)
-        side_layout.addWidget(self._add_device_btn)
+        side_layout.addWidget(devices, 1)
         side_layout.addWidget(self._capture_btn)
         side_layout.addWidget(session_group)
-        side_layout.addStretch(1)
-
-        # Two device panels plus the recording controls outgrow most windows,
-        # so the column scrolls rather than squeezing its contents.
-        side = QScrollArea()
-        side.setWidget(inner)
-        side.setWidgetResizable(True)
         # A minimum as well as a maximum: with only a maximum the splitter
         # collapsed the whole column to a sliver and gave the space to the plot.
         side.setMinimumWidth(430)
         side.setMaximumWidth(520)
-        side.setFrameShape(QScrollArea.NoFrame)
 
         self._live = LiveView()
 
@@ -492,20 +532,35 @@ class MainWindow(QMainWindow):
     # ----- readiness and devices -----------------------------------------
 
     def _check_readiness(self) -> None:
+        """Say when capture cannot work, and otherwise say nothing.
+
+        This used to be three lines of orange above everything, permanently,
+        including on a machine where capture was working perfectly. A warning
+        that is always there is not read; one that appears only when something
+        is wrong is.
+        """
         state = capture_readiness()
-        if state.ok:
-            text = f"<span style='color:#1a7f37'>Capture ready \u2014 {state.detail}.</span>"
-            if state.warning:
-                text += f"<br><span style='color:#a04000'>{state.warning}</span>"
-            self._readiness.setText(text)
-        else:
-            self._readiness.setText(
-                f"<b style='color:#a04000'>Cannot capture: {state.detail}.</b>"
-                f"<br>{state.remedy}"
-                "<br><span style='color:#555'>A device read over Modbus does "
-                "not need this.</span>"
-            )
         self._capture_ready = state.ok
+        if state.ok and not state.warning:
+            self._readiness.hide()
+            return
+        self._readiness.show()
+        if state.ok:
+            self._readiness.setText(
+                f"<span style='color:#a04000'>{state.warning}</span>"
+            )
+            self._readiness.setToolTip(state.detail)
+            return
+        self._readiness.setText(
+            f"<b style='color:#a04000'>Cannot capture: {state.detail}.</b> "
+            "<a href='#' style='color:#1f77b4;'>what to do</a>"
+        )
+        self._readiness_detail = (
+            f"{state.remedy}\n\n"
+            "A device read over Modbus, or from its own software, does not "
+            "need this."
+        )
+        self._readiness.setToolTip(self._readiness_detail)
 
     def _refresh_devices(self, monitor: Optional[DeviceMonitor] = None) -> None:
         neighbors, diagnostic = arp_neighbors()
@@ -1064,14 +1119,7 @@ class MainWindow(QMainWindow):
         # instrument nobody has decoded yet needs — refusing to record it meant
         # the one case the raw file exists for was the one case it was denied.
         # The CSV then has no signal columns, and the banner says so.
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        if len(configured) == 1:
-            stem = _slug(configured[0].profile.name)
-        elif configured:
-            stem = "_".join(_slug(m.name) for m in configured)
-        else:
-            stem = "_".join(_slug(m.name) for m in self._monitors) or "capture"
-        base = _unclaimed(self._output_dir / f"{stem}_{stamp}")
+        base = _unclaimed(self._output_dir / self._session_stem())
         names: List[str] = []
         units: Dict[str, str] = {}
         # Every device that has signals, not only the ones with a profile. A
@@ -1312,6 +1360,36 @@ class MainWindow(QMainWindow):
         self._session_label.setStyleSheet(_theme.muted(self._dark))
         self._update_session_label()
 
+    def _automatic_stem(self) -> str:
+        """The name a session gets when none was asked for."""
+        configured = [m for m in self._monitors if m.profile is not None]
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        if len(configured) == 1:
+            stem = _slug(configured[0].profile.name)
+        elif configured:
+            stem = "_".join(_slug(m.name) for m in configured)
+        else:
+            stem = "_".join(_slug(m.name) for m in self._monitors) or "capture"
+        return f"{stem}_{stamp}"
+
+    def _session_stem(self) -> str:
+        """The file name for the session about to open.
+
+        A name typed by the user wins, and it wins for a session the instrument
+        starts as much as for one started by hand - those are the runs where a
+        name is worth having, and they are exactly the ones nobody is at the
+        keyboard for.
+        """
+        chosen = _slug(self._next_name.text()) if self._next_name.text().strip() else ""
+        return chosen or self._automatic_stem()
+
+    def _show_next_name(self) -> None:
+        """Show the file that will actually be written, before it is."""
+        stem = self._session_stem()
+        typed = bool(self._next_name.text().strip())
+        note = "" if typed else "  (from the profile and the clock)"
+        self._name_preview.setText(f"{stem}.csv{note}")
+
     def _show_output_dir(self) -> None:
         self._output_label.setText(
             f'<a href="#" style="color:#1f77b4;">{self._output_dir}</a>'
@@ -1328,6 +1406,7 @@ class MainWindow(QMainWindow):
     def _refresh_titles(self) -> None:
         for form in self._device_forms:
             form.refresh_title()
+        self._show_next_name()
 
     def _update_controls(self) -> None:
         capturing = self._capturing

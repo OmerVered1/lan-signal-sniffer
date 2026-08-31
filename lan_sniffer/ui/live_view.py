@@ -28,6 +28,7 @@ import pyqtgraph as pg
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -54,6 +55,14 @@ CURVE_COLOURS = (
 
 # Panels beyond this and each is too short to read; the rest share the last one.
 MAX_PANELS = 6
+
+# The stretches of a run worth looking at, and "all" for the whole thing.
+WINDOWS = (
+    ("2 min", 120.0),
+    ("10 min", 600.0),
+    ("1 hour", 3600.0),
+    ("all", 0.0),
+)
 
 
 class Theme:
@@ -119,6 +128,17 @@ class LiveView(QWidget):
         self._chart = pg.GraphicsLayoutWidget()
         self._chart.setBackground(self._theme.background)
 
+        # How much of the run to show. Thirteen hours drawn at once is a
+        # compressed smear, and the part worth watching is almost always the
+        # end of it - but the data is kept in full either way, so this only
+        # changes the view.
+        self._window = QComboBox()
+        for label, seconds in WINDOWS:
+            self._window.addItem(label, seconds)
+        self._window.setCurrentIndex(len(WINDOWS) - 1)
+        self._window.setToolTip("How much of the run to draw. Nothing is discarded.")
+        self._window.currentIndexChanged.connect(self.redraw)
+
         self._normalise = QCheckBox("Normalise")
         self._normalise.setToolTip(
             "Put every curve on one panel, each scaled to its own range.\n"
@@ -137,8 +157,27 @@ class LiveView(QWidget):
         self._hint = QLabel("")
         self._hint.setStyleSheet("color:#888; font-size:11px;")
 
+        # What the curves read at the cursor. A chart that shows a peak but
+        # cannot say how big it is sends you to the CSV to answer a question
+        # you are already looking at.
+        self._cursor = QLabel("")
+        self._cursor.setTextFormat(Qt.RichText)
+        self._cursor.setStyleSheet("font-size:10px;")
+        self._cursor.setWordWrap(True)
+        self._cursor.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        # Room for three lines. Fifteen signals do not fit on one, and the ones
+        # that fell off the end were the mass spectrometer's - which is the
+        # whole reason for reading values off the chart. Given too little height
+        # the label draws its lines on top of each other rather than clipping,
+        # so this is fixed rather than merely capped.
+        self._cursor.setFixedHeight(44)
+        self._crosshairs: List[pg.InfiniteLine] = []
+        self._chart.scene().sigMouseMoved.connect(self._on_mouse)
+
         controls = QHBoxLayout()
         controls.setContentsMargins(6, 0, 6, 0)
+        controls.addWidget(QLabel("Show"))
+        controls.addWidget(self._window)
         controls.addWidget(self._normalise)
         controls.addWidget(self._all)
         controls.addWidget(self._none)
@@ -150,6 +189,7 @@ class LiveView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._chart, 1)
+        layout.addWidget(self._cursor)
         layout.addLayout(controls)
         layout.addLayout(self._legend_row)
 
@@ -236,6 +276,17 @@ class LiveView(QWidget):
                 )
             self._panels.append(panel)
 
+        self._crosshairs = []
+        for panel in self._panels:
+            line = pg.InfiniteLine(
+                angle=90, movable=False,
+                pen=pg.mkPen(self._theme.foreground, width=1, style=Qt.DotLine),
+            )
+            line.setVisible(False)
+            line.setZValue(10)
+            panel.addItem(line, ignoreBounds=True)
+            self._crosshairs.append(line)
+
         self._hint.setText(
             "each curve scaled to its own range"
             if normalised
@@ -307,23 +358,111 @@ class LiveView(QWidget):
     def redraw(self) -> None:
         """Push buffered points to the curves. Called on a timer, not per sample."""
         normalised = self._normalise.isChecked()
+        span = self._window.currentData() or 0.0
+        newest = max(
+            (t[-1] for t in self._times.values() if t), default=0.0
+        )
+        floor = newest - span if span else None
         for name, curve in self._curves.items():
+            box = self._boxes.get(name)
+            if box is not None and not box.isChecked():
+                continue
+            times = list(self._times.get(name) or ())
+            if not times:
+                continue
+            values = list(self._values[name])
+            if floor is not None:
+                # Trim from the left only. Normalising a window scales it to
+                # what is on screen, which is the point of looking at one.
+                keep = _first_at_or_after(times, floor)
+                times, values = times[keep:], values[keep:]
+                if not times:
+                    continue
+            if normalised:
+                values = _to_unit_range(values)
+            curve.setData(times, values)
+
+    def _on_mouse(self, position) -> None:
+        """Track the cursor across every panel and read the curves under it."""
+        if not self._panels:
+            return
+        found = None
+        for panel in self._panels:
+            if panel.sceneBoundingRect().contains(position):
+                found = panel.vb.mapSceneToView(position).x()
+                break
+        if found is None:
+            for line in self._crosshairs:
+                line.setVisible(False)
+            self._cursor.setText("")
+            return
+        for line in self._crosshairs:
+            line.setPos(found)
+            line.setVisible(True)
+        self._cursor.setText(self._read_at(found))
+
+    def _read_at(self, when: float) -> str:
+        """What each visible curve reads at this moment, as one line."""
+        parts = [f'<span style="color:#888;">t = {when:,.1f} s</span>']
+        for name in self._names:
             box = self._boxes.get(name)
             if box is not None and not box.isChecked():
                 continue
             times = self._times.get(name)
             if not times:
                 continue
-            values = list(self._values[name])
-            if normalised:
-                values = _to_unit_range(values)
-            curve.setData(list(times), values)
+            index = _nearest(list(times), when)
+            if index is None:
+                continue
+            value = list(self._values[name])[index]
+            unit = self._units.get(name, "")
+            short = name.split(".", 1)[-1]
+            parts.append(
+                f'<span style="color:{colour_for(name)};">{short}</span> '
+                f"<b>{_readable(value)}</b>"
+                + (f' <span style="color:#888;">{unit}</span>' if unit else "")
+            )
+        return "  \u00b7  ".join(parts)
 
     def _apply_visibility(self) -> None:
         for name, curve in self._curves.items():
             box = self._boxes.get(name)
             curve.setVisible(bool(box is None or box.isChecked()))
         self.redraw()
+
+
+def _nearest(times: List[float], when: float) -> Optional[int]:
+    """The sample closest to a moment, or None if the cursor is off the run.
+
+    Off the end returns nothing rather than the last value: a flat line held
+    past the end of the data would read as a measurement that continued.
+    """
+    import bisect
+
+    if not times:
+        return None
+    if when < times[0] - 1.0 or when > times[-1] + 1.0:
+        return None
+    i = bisect.bisect_left(times, when)
+    if i == 0:
+        return 0
+    if i >= len(times):
+        return len(times) - 1
+    return i if abs(times[i] - when) < abs(times[i - 1] - when) else i - 1
+
+
+def _readable(value: float) -> str:
+    """A number a person can take in at a glance, at any magnitude."""
+    from .device_form import _readable as fmt
+
+    return fmt(value)
+
+
+def _first_at_or_after(times: List[float], floor: float) -> int:
+    """Index of the first point inside the window. Times only ever increase."""
+    import bisect
+
+    return bisect.bisect_left(times, floor)
 
 
 def _to_unit_range(values: List[float]) -> List[float]:

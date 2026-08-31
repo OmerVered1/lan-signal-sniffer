@@ -8,6 +8,8 @@ alive, what is it reading, and is any of it being written down.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("PyQt5.QtWidgets")
@@ -169,5 +171,109 @@ def test_nothing_on_the_window_stays_light_when_the_theme_goes_dark(qapp):
             assert "#e8e8e8" not in style and "color:#555" not in style, style
         w._apply_theme(False)
         assert "#e8e8e8" in w._banner.styleSheet()
+    finally:
+        w.close()
+
+
+# ----- naming the next session -----------------------------------------------
+
+
+def window(tmp_path):
+    from lan_sniffer.ui import main_window as mw
+
+    mw.PROFILE_DIR = tmp_path / "profiles"
+    w = mw.MainWindow()
+    w._output_dir = tmp_path / "sessions"
+    return w
+
+
+def test_a_typed_name_is_used_for_the_next_session(qapp, tmp_path):
+    w = window(tmp_path)
+    try:
+        w._next_name.setText("CeNi3 850C ArH2 run 4")
+        assert w._session_stem() == "ceni3_850c_arh2_run_4"
+        assert "ceni3_850c_arh2_run_4.csv" in w._name_preview.text()
+    finally:
+        w.close()
+
+
+def test_a_typed_name_applies_to_a_run_the_instrument_starts(qapp, tmp_path):
+    """Those are the runs nobody is at the keyboard for, and the ones a name
+    is worth having on."""
+    w = window(tmp_path)
+    try:
+        w._next_name.setText("overnight tpd")
+        w._capturing = True
+        w._open_session(manual=False)
+        assert w._csv is not None
+        assert Path(w._csv.path).name.startswith("overnight_tpd")
+    finally:
+        w._csv = None
+        w.close()
+
+
+def test_without_a_name_the_profile_and_the_clock_are_used(qapp, tmp_path):
+    w = window(tmp_path)
+    try:
+        assert w._next_name.text() == ""
+        stem = w._session_stem()
+        assert stem.endswith(tuple("0123456789")), "the clock is on the end"
+        assert "(from the profile and the clock)" in w._name_preview.text()
+    finally:
+        w.close()
+
+
+def test_the_same_name_twice_does_not_overwrite_the_first(qapp, tmp_path):
+    """A repeat of one condition is exactly when a name gets reused."""
+    w = window(tmp_path)
+    try:
+        w._next_name.setText("run 4")
+        w._capturing = True
+        w._open_session(manual=True)
+        first = Path(w._csv.path)
+        w._close_session(manual=True)
+        w._open_session(manual=True)
+        second = Path(w._csv.path)
+        w._close_session(manual=True)
+        assert first != second, "the second run must not land on the first"
+        assert first.exists() and second.exists()
+    finally:
+        w.close()
+
+
+# ----- the readiness line ----------------------------------------------------
+
+
+def test_a_working_capture_says_nothing_at_all(qapp, tmp_path, monkeypatch):
+    """A warning that is always there is not read."""
+    from lan_sniffer.capture.capture import Readiness
+    from lan_sniffer.ui import main_window as mw
+
+    monkeypatch.setattr(
+        mw, "capture_readiness", lambda: Readiness(ok=True, detail="npcap")
+    )
+    w = window(tmp_path)
+    try:
+        w._check_readiness()
+        assert not w._readiness.isVisibleTo(w)
+    finally:
+        w.close()
+
+
+def test_a_broken_capture_says_so_in_one_line(qapp, tmp_path, monkeypatch):
+    from lan_sniffer.capture.capture import Readiness
+    from lan_sniffer.ui import main_window as mw
+
+    monkeypatch.setattr(
+        mw,
+        "capture_readiness",
+        lambda: Readiness(ok=False, detail="Npcap is missing", remedy="Install it."),
+    )
+    w = window(tmp_path)
+    try:
+        w._check_readiness()
+        assert w._readiness.isVisibleTo(w)
+        assert w._readiness.text().count("<br>") == 0, "one line, not three"
+        assert "Install it." in w._readiness_detail
     finally:
         w.close()
