@@ -51,6 +51,43 @@ from lan_sniffer.writers.raw_writer import read_raw  # noqa: E402
 CONFIRM = "--vendor-software-is-closed"
 
 
+def _search_dirs():
+    """Where a request list might live, frozen or from a checkout."""
+    seen = []
+    bundled = getattr(sys, "_MEIPASS", None)  # set by PyInstaller at run time
+    if bundled:
+        seen.append(Path(bundled))
+    seen.append(Path(sys.argv[0]).resolve().parent)
+    seen.append(Path(__file__).resolve().parents[1])
+    return seen
+
+
+def resolve_source(name: str) -> Path:
+    """Find a capture or a saved request list, by path or by bare name.
+
+    The packaged build carries `probe_lists/` inside it, so on the machine wired
+    to the instrument `max300_requests` is enough and nothing has to be copied
+    alongside the executable.
+    """
+    direct = Path(name)
+    if direct.exists():
+        return direct
+    for base in _search_dirs():
+        for candidate in (
+            base / name,
+            base / "probe_lists" / name,
+            base / "probe_lists" / f"{name}.json",
+        ):
+            if candidate.exists():
+                return candidate
+    raise SystemExit(
+        f"Could not find {name!r}.\n"
+        "Give a path to a .raw.jsonl capture or to a list saved by "
+        "`list --save`, or the name of one that ships with this build "
+        "(try: max300_requests)."
+    )
+
+
 def load(args) -> list:
     """The requests to work from: a capture, or a list saved from one.
 
@@ -59,7 +96,7 @@ def load(args) -> list:
     `list --save` writes the few kilobytes that actually matter so they can be
     carried across.
     """
-    source = Path(args.capture)
+    source = resolve_source(args.capture)
     if source.suffix == ".json":
         saved = json.loads(source.read_text(encoding="utf-8"))
         found = [
@@ -91,7 +128,7 @@ def cmd_list(args) -> int:
         Path(args.save).write_text(
             json.dumps(
                 {
-                    "source": Path(args.capture).name,
+                    "source": resolve_source(args.capture).name,
                     "device": args.device or "",
                     "requests": [
                         {
@@ -110,7 +147,7 @@ def cmd_list(args) -> int:
         print(f"saved {len(found)} request(s) to {args.save}\n"
               f"Copy that file to the machine wired to the instrument and use "
               f"it in place of the capture.\n")
-    print(f"{len(found)} distinct request(s) in {Path(args.capture).name}\n")
+    print(f"{len(found)} distinct request(s) in {resolve_source(args.capture).name}\n")
     by_opcode = {}
     for request in found:
         by_opcode.setdefault(request.opcode, []).append(request)

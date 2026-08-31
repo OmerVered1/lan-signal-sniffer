@@ -82,6 +82,30 @@ jobs:
           $built = "installer_out\LAN-Signal-Sniffer-Setup-${{ steps.ver.outputs.version }}.exe"
           Copy-Item $built "LAN-Signal-Sniffer-Windows-Setup.exe"
 
+      - name: Build the probe tool as a standalone console executable
+        # Separate from the app: it transmits, so it is a command you type on a
+        # machine where the instrument's own software is deliberately closed,
+        # not a button in a window. One file, request lists bundled inside.
+        run: pyinstaller probe_analyser.spec --noconfirm
+
+      - name: Check the probe executable was produced
+        shell: pwsh
+        run: |
+          $exe = "dist\probe-analyser.exe"
+          if (-not (Test-Path $exe)) {
+            throw "PyInstaller did not produce $exe"
+          }
+          Copy-Item $exe "probe-analyser.exe"
+          Write-Host "built: $((Get-Item $exe).Length) bytes"
+
+      - name: Check it runs and finds its bundled request list
+        shell: pwsh
+        run: |
+          $out = & ".\probe-analyser.exe" list max300_requests
+          if ($LASTEXITCODE -ne 0) { throw "probe-analyser exited $LASTEXITCODE" }
+          if ($out -notmatch "distinct request") { throw "unexpected output: $out" }
+          Write-Host ($out | Select-Object -First 1)
+
       - name: Also package the plain folder build
         shell: pwsh
         run: |
@@ -94,6 +118,7 @@ jobs:
           path: |
             LAN-Signal-Sniffer-Windows-Setup.exe
             LAN-Signal-Sniffer-Windows-portable.zip
+            probe-analyser.exe
 
   build-macos:
     needs: test
@@ -136,6 +161,7 @@ jobs:
           files: |
             artifacts/windows/LAN-Signal-Sniffer-Windows-Setup.exe
             artifacts/windows/LAN-Signal-Sniffer-Windows-portable.zip
+            artifacts/windows/probe-analyser.exe
             artifacts/macos/LAN-Signal-Sniffer-macOS.zip
           generate_release_notes: true
           body: |

@@ -268,16 +268,28 @@ are detector noise rather than a repeatable spectrum. Questor computes the
 published values and writes them to a file. No amount of sniffing that link
 produces them — but nobody had asked the analyser itself.
 
+Download **`probe-analyser.exe`** from
+[Releases](https://github.com/OmerVered1/lan-signal-sniffer/releases) and run it
+from a terminal on the machine wired to the instrument. It needs no Python, no
+install and no capture driver, and the request lists are bundled inside it:
+
 ```bash
-python tools/probe_analyser.py list session.raw.jsonl --device 172.16.0.1
+probe-analyser.exe list max300_requests
 ```
 
-The capture that recorded these is often gigabytes and rarely lives on the
-machine wired to the instrument, so `list --save requests.json` writes the few
-kilobytes that matter and every command accepts that file in place of the
-capture. `probe_lists/max300_requests.json` is the MAX300's, already extracted.
+From a checkout it is the same tool, one word longer:
 
-`list` touches no network. `replay` sends each observed request once and shows
+```bash
+python tools/probe_analyser.py list probe_lists/max300_requests.json
+```
+
+`list` touches no network at all. The capture these requests came from is often
+gigabytes and rarely lives on the machine wired to the instrument, so
+`list --save requests.json` writes the few kilobytes that matter, and every
+command takes that file — or the bare name of one bundled in the build — in
+place of the capture.
+
+`replay` sends each observed request once and shows
 what comes back; `sweep` varies a single 32-bit field of one observed request
 through an address range, which is how you find out whether the instrument holds
 something its own software never asks for.

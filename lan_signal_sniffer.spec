@@ -27,7 +27,7 @@ a = Analysis(
     binaries=[],
     # Profiles ship alongside the executable so a fresh install can record from
     # a known instrument without going through identification first.
-    datas=[("profiles", "profiles")],
+    datas=[("profiles", "profiles"), ("assets", "assets")],
     hiddenimports=[
         "lan_sniffer",
         "lan_sniffer._version",
@@ -118,7 +118,7 @@ if sys.platform == "darwin":
         icon=icon_path,
         bundle_identifier="il.ac.bgu.omervered.lansignalsniffer",
         info_plist={
-            "CFBundleShortVersionString": "0.12.0",
+            "CFBundleShortVersionString": "0.12.1",
             "NSHighResolutionCapable": True,
         },
     )
