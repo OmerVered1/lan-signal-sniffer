@@ -42,6 +42,7 @@ class DeviceForm(QGroupBox):
     calibrate_requested = pyqtSignal(object)
     import_requested = pyqtSignal(object)
     modbus_requested = pyqtSignal(object)
+    questor_requested = pyqtSignal(object)
     survey_requested = pyqtSignal(object)
 
     def __init__(self, monitor: DeviceMonitor, parent=None) -> None:
@@ -104,6 +105,7 @@ class DeviceForm(QGroupBox):
         self._calibrate = QPushButton("Teach idle vs running…")
         self._import = QPushButton("Import profile…")
         self._modbus = QPushButton("Read over Modbus…")
+        self._questor = QPushButton("Read from Questor…")
         self._survey = QPushButton("Record everything")
         self._remove = QPushButton("Remove device")
 
@@ -111,6 +113,11 @@ class DeviceForm(QGroupBox):
         self._modbus.setToolTip(
             "For an instrument whose software publishes its results in Modbus\n"
             "registers rather than putting them on the wire."
+        )
+        self._questor.setToolTip(
+            "For an Extrel analyser: read the values Questor5 computes, from\n"
+            "the endpoint its own results page uses. Nothing is changed in\n"
+            "Questor and nothing is asked of the instrument."
         )
         self._survey.setToolTip(
             "Record every plausible reading from this device, with the raw\n"
@@ -121,6 +128,7 @@ class DeviceForm(QGroupBox):
         self._calibrate.clicked.connect(lambda: self.calibrate_requested.emit(self.monitor))
         self._import.clicked.connect(lambda: self.import_requested.emit(self.monitor))
         self._modbus.clicked.connect(lambda: self.modbus_requested.emit(self.monitor))
+        self._questor.clicked.connect(lambda: self.questor_requested.emit(self.monitor))
         self._survey.clicked.connect(lambda: self.survey_requested.emit(self.monitor))
         self._remove.clicked.connect(lambda: self.remove_requested.emit(self.monitor))
 
@@ -128,7 +136,7 @@ class DeviceForm(QGroupBox):
         actions.setContentsMargins(8, 0, 8, 4)
         for i, button in enumerate(
             (self._identify, self._calibrate, self._import, self._modbus,
-             self._survey, self._remove)
+             self._questor, self._survey, self._remove)
         ):
             actions.addWidget(button, i // 2, i % 2)
 
@@ -251,6 +259,7 @@ class DeviceForm(QGroupBox):
             widget.setEnabled(not capturing)
         self._remove.setEnabled(not capturing and removable)
         self._modbus.setEnabled(not capturing)
+        self._questor.setEnabled(not capturing)
         self._import.setEnabled(not capturing)
         sniffing = capturing and not self.monitor.reads_registers
         self._identify.setEnabled(sniffing)

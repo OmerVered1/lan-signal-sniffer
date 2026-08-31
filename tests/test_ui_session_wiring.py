@@ -470,3 +470,82 @@ def test_the_banner_does_not_read_as_a_failed_recording(qapp, tmp_path, monkeypa
     assert "RECORDING" in text
     assert "raw only" in text
     assert "0 rows" not in text
+
+
+# ----- a device read from Questor's web interface ----------------------------
+
+
+def test_a_questor_device_records_beside_a_sniffed_one(qapp, tmp_path, monkeypatch):
+    """The point of the whole exercise: both instruments, one file, one clock."""
+    from lan_sniffer.readers.questor import QuestorClient
+    from lan_sniffer.ui import main_window as mw
+
+    fixture = (Path(__file__).parent / "fixtures" / "questor_results.xml").read_bytes()
+
+    class Canned:
+        """A fresh result every time, as a live instrument produces."""
+
+        name = "fake"
+
+        def __init__(self):
+            self.n = 0
+
+        def post(self, url, body, timeout_s):
+            self.n += 1
+            stamp = f"2026-08-31T13:{14 + self.n // 60:02d}:{self.n % 60:02d}.000"
+            return fixture.replace(b"2026-08-31T13:14:35.527", stamp.encode())
+
+    monkeypatch.setattr(mw, "PROFILE_DIR", tmp_path / "profiles")
+    w = mw.MainWindow()
+    w._output_dir = tmp_path / "sessions"
+    configure(w, 0, "dsc", "169.254.93.1")
+    w._add_device()
+    ms = w._monitors[1]
+    # Through the form, as the UI does, so the column prefix is recomputed.
+    w._device_forms[1].set_label("ms")
+    w._device_forms[1].save()
+    w._assign_prefixes()
+    ms.config.questor_host = "localhost"
+    ms.config.controls_recording = False
+    # The whole run replays in milliseconds, so the rate gate would allow one
+    # poll and it would land before the session opened.
+    ms.config.questor_interval_s = 0.0
+    ms.questor = QuestorClient()
+    ms.questor.transport = Canned()
+    # Priming, the way start_capture does: the tag names have to be known
+    # before a session fixes its columns.
+    for entry in ms.questor.poll():
+        ms._questor_tags.extend(entry.values)
+        ms._questor_units.update(entry.units)
+    ms.questor.reset()
+    ms._next_questor = 0.0
+    arm(w)
+
+    feed(w, a_run(start_at=5.0, stop_at=40.0, until=50.0))
+    w.close()
+
+    files = list((tmp_path / "sessions").glob("*.csv"))
+    assert files, "a session should have been recorded"
+    text = files[0].read_text(encoding="utf-8")
+    header = text.splitlines()[0]
+    assert "ms.V1_C_O2" in header, header
+    assert "dsc.sample_temperature" in header, header
+    # Written to nine significant figures, as every other column is.
+    assert "73.2416306" in text, "Questor's value should be in the file"
+    assert "2026-08-31" in text, "its own timestamps, not the sniffer's"
+
+
+def test_a_questor_device_cannot_open_or_close_a_session(qapp, tmp_path, monkeypatch):
+    """Questor is always acquiring - it has no experiment to start or stop."""
+    from lan_sniffer.ui import main_window as mw
+
+    monkeypatch.setattr(mw, "PROFILE_DIR", tmp_path / "profiles")
+    w = mw.MainWindow()
+    w._output_dir = tmp_path / "sessions"
+    w._device_forms[0].set_label("ms")
+    w._monitors[0].config.questor_host = "localhost"
+    w._monitors[0].config.controls_recording = False
+    arm(w)
+    assert w._monitors[0].reads_questor
+    assert w._monitors[0].detector is None
+    w.close()

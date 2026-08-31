@@ -39,6 +39,8 @@ a = Analysis(
         "lan_sniffer.ui.device_form",
         "lan_sniffer.readers.modbus",
         "lan_sniffer.readers.probe",
+        "lan_sniffer.readers.questor",
+        "lan_sniffer.ui.questor_setup",
         "lan_sniffer.updater",
         "lan_sniffer.capture.capture",
         "lan_sniffer.capture.neighbors",
@@ -118,7 +120,7 @@ if sys.platform == "darwin":
         icon=icon_path,
         bundle_identifier="il.ac.bgu.omervered.lansignalsniffer",
         info_plist={
-            "CFBundleShortVersionString": "0.14.0",
+            "CFBundleShortVersionString": "0.15.0",
             "NSHighResolutionCapable": True,
         },
     )

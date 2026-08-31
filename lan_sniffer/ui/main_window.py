@@ -355,6 +355,7 @@ class MainWindow(QMainWindow):
         form.calibrate_requested.connect(self._calibrate)
         form.import_requested.connect(self._import_profile)
         form.modbus_requested.connect(self._setup_modbus)
+        form.questor_requested.connect(self._setup_questor)
         form.survey_requested.connect(self._toggle_survey)
         form.refresh_button.clicked.connect(lambda: self._refresh_devices(monitor))
         self._device_forms.append(form)
@@ -754,6 +755,42 @@ class MainWindow(QMainWindow):
 
     # ----- reading a device over Modbus -----------------------------------
 
+    def _setup_questor(self, monitor: DeviceMonitor) -> None:
+        """Point a device at Questor5's results endpoint.
+
+        No profile and no identification: Questor names its own tags and states
+        their units, so there is nothing here for the wizard to work out.
+        """
+        from .questor_setup import QuestorSetupDialog
+
+        dialog = QuestorSetupDialog(
+            host=monitor.config.questor_host or "localhost",
+            port=monitor.config.questor_port or 80,
+            interval_s=monitor.config.questor_interval_s,
+            parent=self,
+        )
+        if dialog.exec_() != QuestorSetupDialog.Accepted:
+            return
+
+        monitor.config.questor_host = dialog.host
+        monitor.config.questor_port = dialog.port
+        monitor.config.questor_interval_s = dialog.interval_s
+        # A reader has no traffic to watch and no run of its own, so it must
+        # never be the thing that opens or closes a file: Questor is always
+        # acquiring and has no notion of an experiment.
+        monitor.config.controls_recording = False
+        monitor.apply_profile(None)
+        self._refresh_titles()
+        self._update_controls()
+        QMessageBox.information(
+            self,
+            "Reading from Questor",
+            f"{monitor.name} will read {dialog.host} every "
+            f"{dialog.interval_s:g} s.\n\n"
+            "Its columns appear once it has answered - Questor names its own "
+            "tags, so they are not known until then.",
+        )
+
     def _setup_modbus(self, monitor: DeviceMonitor) -> None:
         """Configure a device whose software publishes values in registers.
 
@@ -1011,7 +1048,12 @@ class MainWindow(QMainWindow):
         base = _unclaimed(self._output_dir / f"{stem}_{stamp}")
         names: List[str] = []
         units: Dict[str, str] = {}
-        for monitor in configured:
+        # Every device that has signals, not only the ones with a profile. A
+        # device read from its software's own interface names its columns from
+        # what that software answered, and has no profile at all - collecting
+        # only from profiled devices left its readings out of the file while
+        # recording them perfectly well into memory.
+        for monitor in self._monitors:
             names.extend(monitor.signal_names())
             units.update(monitor.units())
         try:

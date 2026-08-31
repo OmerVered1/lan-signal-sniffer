@@ -14,6 +14,7 @@ it always did, and files from before this existed stay comparable.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -45,6 +46,13 @@ class DeviceConfig:
     # polls continuously and has no notion of a run at all, so letting it open
     # or close the file would be wrong.
     controls_recording: bool = True
+    # A device can also be Questor5's web interface rather than a link to
+    # watch. A process analyser that computes its results in software never
+    # puts them on the instrument's wire - asking its software for them is the
+    # route the numbers actually take to the screen.
+    questor_host: str = ""
+    questor_port: int = 80
+    questor_interval_s: float = 3.0
 
 
 @dataclass
@@ -76,9 +84,18 @@ class DeviceMonitor:
         self.reader: Optional[ModbusClient] = None
         self._next_read = 0.0
         self.last_error: Optional[str] = None
+        self.questor = None
+        self._questor_tags: List[str] = []
+        self._questor_units: Dict[str, str] = {}
+        self._next_questor = 0.0
         self.apply_profile(config.profile)
 
     # ----- configuration --------------------------------------------------
+
+    @property
+    def reads_questor(self) -> bool:
+        """True for a device read from Questor5's own results endpoint."""
+        return bool(self.config.questor_host)
 
     @property
     def reads_registers(self) -> bool:
@@ -108,11 +125,21 @@ class DeviceMonitor:
         return f"{self.prefix}{signal}" if self.prefix else signal
 
     def signal_names(self) -> List[str]:
+        if self.reads_questor:
+            # Questor names its own tags, and they are only known once it has
+            # answered - so a session opened before the first reply has nothing
+            # to write for this device, and gains the columns when it does.
+            return [self.qualify(name) for name in self._questor_tags]
         if not self.profile:
             return []
         return [self.qualify(name) for name in self.profile.signal_names]
 
     def units(self) -> Dict[str, str]:
+        if self.reads_questor:
+            return {
+                self.qualify(name): self._questor_units.get(name, "")
+                for name in self._questor_tags
+            }
         if not self.profile:
             return {}
         return {
@@ -127,6 +154,9 @@ class DeviceMonitor:
         return self.pump is not None
 
     def start_capture(self, interface: Optional[str]) -> None:
+        if self.reads_questor:
+            self.open_questor()
+            return
         if self.reads_registers:
             self.open_reader()
             return
@@ -136,6 +166,9 @@ class DeviceMonitor:
         self._carry.clear()
 
     def stop_capture(self) -> None:
+        if self.questor is not None:
+            self.questor.close()
+            self.questor = None
         self.close_reader()
         pump, self.pump = self.pump, None
         if pump is not None:
@@ -165,7 +198,44 @@ class DeviceMonitor:
         if reader is not None:
             reader.close()
 
+    def open_questor(self) -> None:
+        """Start reading Questor5's results endpoint."""
+        from .readers.questor import QuestorClient
+
+        self.questor = QuestorClient(
+            host=self.config.questor_host, port=self.config.questor_port or 80
+        )
+        self._questor_tags = []
+        self._questor_units = {}
+        self._next_questor = 0.0
+        self.last_error = None
+        try:
+            self.questor.open()
+        except Exception as e:
+            self.last_error = str(e)
+            return
+
+        # Ask once now, to learn the tag names. A session fixes its columns
+        # when it opens, and a recording that starts the moment the oven does
+        # would otherwise have no columns for this device at all - its first
+        # answer would arrive too late to be in the header.
+        #
+        # The readings from this poll are deliberately dropped: nothing is
+        # recording yet, and keeping them would file measurements taken before
+        # the run under the run.
+        try:
+            for entry in self.questor.poll():
+                for name in entry.values:
+                    if name not in self._questor_tags:
+                        self._questor_tags.append(name)
+                self._questor_units.update(entry.units)
+        except Exception as e:
+            self.last_error = str(e)
+        self._next_questor = time.time() + max(0.0, self.config.questor_interval_s)
+
     def status(self) -> str:
+        if self.reads_questor:
+            return self.questor.status() if self.questor else "not reading Questor"
         if self.reads_registers:
             if self.last_error:
                 return f"read failed: {self.last_error}"
@@ -176,9 +246,40 @@ class DeviceMonitor:
 
     def poll(self) -> PollResult:
         """Produce whatever this device has to offer since the last call."""
+        if self.reads_questor:
+            return self._poll_questor()
         if self.reads_registers:
             return self._poll_registers()
         return self._poll_capture()
+
+    def _poll_questor(self) -> PollResult:
+        """Ask Questor for results, no more often than they are produced."""
+        result = PollResult()
+        if self.questor is None:
+            return result
+        now = time.time()
+        if now < self._next_questor:
+            return result
+        # The sensible floor lives in the dialog, which will not accept less
+        # than half a second. Not enforcing it again here keeps the loop honest
+        # about doing what it was configured to do.
+        self._next_questor = now + max(0.0, self.config.questor_interval_s)
+
+        from .readers.questor import local_to_epoch
+
+        for entry in self.questor.poll():
+            for name in entry.values:
+                if name not in self._questor_tags:
+                    self._questor_tags.append(name)
+            self._questor_units.update(entry.units)
+            result.samples.append(
+                Sample(
+                    ts=local_to_epoch(entry.when),
+                    values={self.qualify(k): v for k, v in entry.values.items()},
+                )
+            )
+        self.last_error = self.questor.last_error or None
+        return result
 
     def _poll_registers(self) -> PollResult:
         """Ask the slave for its registers, no faster than configured.

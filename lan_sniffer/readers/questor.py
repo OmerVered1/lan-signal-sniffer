@@ -142,3 +142,188 @@ def parse_results(payload: bytes) -> List[ResultSet]:
             out.append(entry)
     out.sort(key=lambda r: r.when)
     return out
+
+
+# ----- talking to it --------------------------------------------------------
+
+
+def local_to_epoch(when: datetime) -> float:
+    """Put Questor's stamp on the capture clock.
+
+    The stamps carry no time zone, so they are the analyser PC's local clock.
+    The sniffer normally runs on that same PC, so the machine's own offset is
+    the right conversion and needs no configuring - and unlike a typed offset,
+    it cannot be wrong about daylight saving.
+    """
+    return when.astimezone().timestamp()
+
+
+class Transport:
+    """How the request actually gets sent.
+
+    The endpoint requires Windows authentication - anonymous is refused - so
+    this cannot be a plain socket write. Two ways of doing it exist on every
+    machine that runs Questor, and which is available is decided at run time
+    rather than assumed:
+
+      * `curl.exe`, shipped with Windows since 1803, with NTLM through SSPI.
+        Needs nothing installed and no Python package.
+      * `WinHttp.WinHttpRequest.5.1` through COM, which is essentially the
+        object Questor's own page uses. Needs pywin32.
+
+    Negotiate is not offered: this server answers 401 to it and 200 to NTLM.
+    """
+
+    name = "none"
+
+    def post(self, url: str, body: bytes, timeout_s: float) -> bytes:
+        raise NotImplementedError
+
+
+class CurlTransport(Transport):
+    name = "curl"
+
+    def __init__(self) -> None:
+        import shutil
+
+        self.exe = shutil.which("curl.exe") or shutil.which("curl")
+        if not self.exe:
+            raise RuntimeError("curl was not found on this machine")
+
+    def post(self, url: str, body: bytes, timeout_s: float) -> bytes:
+        import subprocess
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as handle:
+            handle.write(body)
+            path = handle.name
+        try:
+            done = subprocess.run(
+                [
+                    self.exe, "-s", "--ntlm", "-u", ":",
+                    "-X", "POST",
+                    "-H", "Content-Type: text/xml",
+                    "-H", "Content-Source: Transport",
+                    "--data-binary", "@" + path,
+                    "--max-time", str(int(max(1, timeout_s))),
+                    url,
+                ],
+                capture_output=True,
+                timeout=timeout_s + 5,
+            )
+        finally:
+            try:
+                __import__("os").unlink(path)
+            except OSError:
+                pass
+        if done.returncode != 0:
+            raise RuntimeError(
+                f"curl failed ({done.returncode}): "
+                + (done.stderr.decode("utf-8", "replace").strip() or "no detail")
+            )
+        return done.stdout
+
+
+class WinHttpTransport(Transport):
+    name = "winhttp"
+
+    def __init__(self) -> None:
+        import win32com.client  # noqa: F401  (import is the availability test)
+
+        self._client = win32com.client
+
+    def post(self, url: str, body: bytes, timeout_s: float) -> bytes:
+        http = self._client.Dispatch("WinHttp.WinHttpRequest.5.1")
+        ms = int(timeout_s * 1000)
+        http.SetTimeouts(ms, ms, ms, ms)
+        http.Open("POST", url, False)
+        http.SetRequestHeader("Content-Type", "text/xml")
+        http.SetRequestHeader("Content-Source", "Transport")
+        http.SetAutoLogonPolicy(0)
+        http.Send(body.decode("utf-8"))
+        if int(http.Status) != 200:
+            raise RuntimeError(f"HTTP {http.Status} {http.StatusText}")
+        return http.ResponseText.encode("utf-8")
+
+
+def open_transport() -> Transport:
+    """Whichever way of sending a request this machine actually has."""
+    problems = []
+    for factory in (CurlTransport, WinHttpTransport):
+        try:
+            return factory()
+        except Exception as e:  # ImportError, RuntimeError, COM errors
+            problems.append(f"{factory.name}: {e}")
+    raise RuntimeError(
+        "no way to send an authenticated request was available - "
+        + "; ".join(problems)
+    )
+
+
+@dataclass
+class QuestorClient:
+    """Polls Questor for results, returning only ones not seen before.
+
+    Asks for several at a time. Results appear about every eight seconds and a
+    poll that is late, or an app that was busy, would otherwise lose the ones
+    in between - the server keeps a short history and handing back a few costs
+    nothing.
+
+    Identity is the valve and the timestamp together, because the same instant
+    on two valves is two different measurements.
+    """
+
+    host: str = "localhost"
+    port: int = DEFAULT_PORT
+    path: str = DEFAULT_PATH
+    count: int = 5
+    timeout_s: float = DEFAULT_TIMEOUT_S
+    transport: Optional[Transport] = None
+    last_error: str = ""
+    _seen: set = field(default_factory=set)
+
+    @property
+    def url(self) -> str:
+        port = "" if self.port in (80, None) else f":{self.port}"
+        return f"http://{self.host}{port}{self.path}"
+
+    def open(self) -> None:
+        if self.transport is None:
+            self.transport = open_transport()
+        self.last_error = ""
+
+    def close(self) -> None:
+        self.transport = None
+
+    def reset(self) -> None:
+        """Forget what has been seen, so a new session starts clean."""
+        self._seen.clear()
+        self.last_error = ""
+
+    def poll(self) -> List[ResultSet]:
+        """Result sets that have appeared since the last call, oldest first."""
+        if self.transport is None:
+            self.open()
+        try:
+            payload = self.transport.post(self.url, build_request(self.count), self.timeout_s)
+            results = parse_results(payload)
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+        self.last_error = ""
+
+        fresh = [r for r in results if r.key not in self._seen]
+        for result in fresh:
+            self._seen.add(result.key)
+        if len(self._seen) > 4096:
+            # Unbounded growth over a long run; keep the recent tail, which is
+            # all that a few-deep history can ever repeat.
+            self._seen = set(sorted(self._seen, key=lambda k: k[1])[-1024:])
+        return fresh
+
+    def status(self) -> str:
+        if self.last_error:
+            return f"Questor: {self.last_error}"
+        if self.transport is None:
+            return "Questor: not connected"
+        return f"Questor: reading ({self.transport.name})"

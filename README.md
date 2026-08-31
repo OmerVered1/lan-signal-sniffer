@@ -256,6 +256,38 @@ A capture minutes long is worth far more than one seconds long here: a channel
 that publishes every 8 seconds contributes two samples to a 20-second capture,
 and nothing can be identified from two samples.
 
+## Reading an instrument whose software computes the answer
+
+Some instruments never put their published values on the wire. A process mass
+spectrometer streams detector data and its software works out the
+concentrations, so watching the link recovers neither — searching four hours of
+a MAX300's traffic found nothing in the ion-current range, and its two large
+arrays correlate at **0.26 and −0.00 between sweeps 2.6 seconds apart**, which
+is noise rather than a repeatable spectrum.
+
+The values still have to reach the screen somehow. In Questor5's case the user
+interface is a web application served by IIS, and its results pane keeps itself
+current by polling a SOAP endpoint once a second — so the numbers cross HTTP,
+and asking the same way the browser does is the supported route rather than a
+trick.
+
+**Read from Questor…** on a device panel points the app at that endpoint. It
+polls, and the values land in the session beside the sniffed instruments, on
+one clock, in one file — which for a coupled rig is the whole object of the
+exercise. Nothing in Questor is configured, no licence is involved, and the
+instrument is never addressed.
+
+The tags name themselves and state their own units, so there is no profile to
+write and nothing to identify. What the dialog offers instead is a **Test
+read**, and it is worth using: the endpoint needs Windows authentication, and
+the two ways of providing it are not on every machine — `curl.exe` ships with
+Windows but only from 1803, and the alternative needs pywin32. Finding that out
+before a run takes a second. Finding it out from an empty column afterwards
+does not.
+
+A device read this way never opens or closes a session. Questor is always
+acquiring and has no notion of an experiment, so the run belongs to the oven.
+
 ## Asking an instrument directly
 
 `tools/probe_analyser.py` is the one thing here that transmits, and it exists
