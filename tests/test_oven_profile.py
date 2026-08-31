@@ -130,3 +130,51 @@ def test_a_run_starts_and_stops_on_calistos_control_writes():
     assert spec["stop_signatures"] == ["00040001000002"]
     # Each is sent once, so requiring a streak would mean a run never starts.
     assert spec["start_streak"] == 1
+
+
+# ----- the pressures Calisto shows but does not export ------------------------
+
+
+def test_the_carrying_gas_pressure_decodes_in_millibar():
+    """Identified by value: the only field in the capture in a pressure range.
+
+    1431 to 1600 mBar over the run, against the 1525 mBar the panel shows at
+    idle. The only other 1000-2000 value anywhere was a constant 1000.0, which
+    is the programme's final temperature.
+    """
+    request = bytes.fromhex("000100140002")
+    reply = request + struct.pack(">f", 1525.0)
+    got = feed([(float(i), request, reply) for i in range(4)])[0].values
+    assert abs(got["carrying_gas_pressure"] - 1525.0) < 1e-4
+
+
+def test_the_gas_panel_family_shares_one_layout():
+    """00010014xxxx is the panel; index 0000 is what proves it.
+
+    Read the same way, 0000 reproduces Calisto's Carrier Gas Flow to a median
+    difference of 0.000000 over 42,649 samples — so the family is the gas
+    panel, and the offset and encoding used for the pressures are the ones
+    already confirmed against the export for a flow.
+    """
+    profile_signals = {s.name: s for s in profile().signals}
+    family = [
+        profile_signals["carrying_gas_pressure"],
+        profile_signals["protective_gas_pressure"],
+    ]
+    for spec in family:
+        assert spec.signature.hex().startswith("00010014")
+        assert spec.offset == 6
+        assert spec.encoding == "f32be"
+        assert spec.unit == "mBar"
+
+
+def test_the_protective_gas_channel_is_flagged_as_positional():
+    """It is constant zero, and so are three other channels.
+
+    Nothing in the data separates it from them; it is index 3 of a family whose
+    other three are confirmed. The notes have to say so, because a reader who
+    assumes it was measured would trust a number that was inferred.
+    """
+    notes = profile().notes
+    assert "position rather than by evidence" in notes
+    assert "not a measurement" in notes

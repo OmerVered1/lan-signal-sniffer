@@ -158,6 +158,40 @@
       "encoding": "f32be",
       "scale": 1.0,
       "bias": 0.0
+    },
+    {
+      "name": "carrying_gas_pressure",
+      "unit": "mBar",
+      "signature": "000100140002",
+      "mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "offset": 6,
+      "encoding": "f32be",
+      "scale": 1.0,
+      "bias": 0.0
+    },
+    {
+      "name": "protective_gas_pressure",
+      "unit": "mBar",
+      "signature": "000100140003",
+      "mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "offset": 6,
+      "encoding": "f32be",
+      "scale": 1.0,
+      "bias": 0.0
     }
   ],
   "session": {
@@ -176,5 +210,5 @@
     "request_mask": {},
     "explanation": "Calisto starts and stops a run by writing one control register: 0004 0001 0000 05 starts, 0004 0001 0000 02 stops. Verified on this instrument - the start write landed 2.0 s after Calisto's own zone start time. Each is sent once, so start_streak is 1. No quiet timeout: this oven is polled continuously between runs, so a session ending on silence would never end."
   },
-  "notes": "Derived from a 19.5-hour TPD capture on 2026-08-27 (CeNi 3% / 850 C / ArH2) and checked against Calisto's own export of the same run.\n\nEverything Calisto plots arrives in the reply to the two-byte request 0008. That channel answers in two shapes: a 6-byte 'nothing new' ack, and a 43-byte status frame carrying the whole row as seven big-endian float32 at offsets 15, 19, 23, 27, 31, 35, 39. The ack is the more common of the two (29,723 against 12,925 over the run) and decodes to nothing, which is correct and harmless - a payload too short for a signal's offset yields no value rather than a wrong one.\n\nIdentification is bit-exact, not statistical: a single frame decoded to 22.557554 / 22.730051 / 20287.716797 / 28.81 / 3.784194 / 20.023611 / 0.0 against a Calisto row of 25.557554 / 22.730051 / 20287.716797 / 28.81 / 3.784194 / 20.023611 / 0.0. Across the run, offsets 23, 27 and 39 match 100% of the time, 19 matches 62% and 35 matches 38% - the misses are sampling jitter, since Calisto logs every 3.3 s and the median difference on every one of them is 0.000000. Correlation over 12,925 frames gives r2 = 1.0000 for furnace temperature, sample temperature and heater power.\n\nsample_temperature carries bias 3.0 deliberately. The wire value is exactly 3.000000 degC below what Calisto displays - measured during the isothermal hold, where sampling jitter contributes nothing: median +3.000000 over 7,358 frames, 1,716 of them matching to within 1e-4. That is a probe calibration offset applied inside Calisto, and this profile reproduces what Calisto shows because that is the number the experiment is recorded against. Set bias to 0.0 to record the uncorrected probe instead.\n\nThe three channels outside the status frame are confirmed by an identity rather than by correlation, which cannot separate quantities that ramp together: programmed_setpoint - (furnace_temperature + control_error) = 0.040 +/- 0.047 degC. The PID regulates furnace temperature towards the setpoint, so the regulated variable is by definition the furnace - which independently confirms offset 19. programmed_setpoint is a float64, not a float32; read as the f32 in its top half it still tracks temperature perfectly and reproduces it not at all.\n\nStart and stop are the same control-register writes as the Setline DSC. 00040001000005 was sent 2.0 s after Calisto's own zone start; 00040001000002 appears in this capture only from the previous run, since this one outlasted the recording. Each is sent once, hence start_streak 1, and there is no quiet timeout because Calisto polls continuously between runs.\n\nNot on the wire: the mass-spectrometer channels that appear in the Calisto export as 18(A), 2(A), 4(A), 32(A), 44(A), 28(A), 40(A). Those reach Calisto through a file written by Questor5, not over the network, and no search of either instrument's traffic will find them. Use File > Merge a vendor export into a session for those."
+  "notes": "Derived from a 19.5-hour TPD capture on 2026-08-27 (CeNi 3% / 850 C / ArH2) and checked against Calisto's own export of the same run.\n\nEverything Calisto plots arrives in the reply to the two-byte request 0008. That channel answers in two shapes: a 6-byte 'nothing new' ack, and a 43-byte status frame carrying the whole row as seven big-endian float32 at offsets 15, 19, 23, 27, 31, 35, 39. The ack is the more common of the two (29,723 against 12,925 over the run) and decodes to nothing, which is correct and harmless - a payload too short for a signal's offset yields no value rather than a wrong one.\n\nIdentification is bit-exact, not statistical: a single frame decoded to 22.557554 / 22.730051 / 20287.716797 / 28.81 / 3.784194 / 20.023611 / 0.0 against a Calisto row of 25.557554 / 22.730051 / 20287.716797 / 28.81 / 3.784194 / 20.023611 / 0.0. Across the run, offsets 23, 27 and 39 match 100% of the time, 19 matches 62% and 35 matches 38% - the misses are sampling jitter, since Calisto logs every 3.3 s and the median difference on every one of them is 0.000000. Correlation over 12,925 frames gives r2 = 1.0000 for furnace temperature, sample temperature and heater power.\n\nsample_temperature carries bias 3.0 deliberately. The wire value is exactly 3.000000 degC below what Calisto displays - measured during the isothermal hold, where sampling jitter contributes nothing: median +3.000000 over 7,358 frames, 1,716 of them matching to within 1e-4. That is a probe calibration offset applied inside Calisto, and this profile reproduces what Calisto shows because that is the number the experiment is recorded against. Set bias to 0.0 to record the uncorrected probe instead.\n\nThe three channels outside the status frame are confirmed by an identity rather than by correlation, which cannot separate quantities that ramp together: programmed_setpoint - (furnace_temperature + control_error) = 0.040 +/- 0.047 degC. The PID regulates furnace temperature towards the setpoint, so the regulated variable is by definition the furnace - which independently confirms offset 19. programmed_setpoint is a float64, not a float32; read as the f32 in its top half it still tracks temperature perfectly and reproduces it not at all.\n\nStart and stop are the same control-register writes as the Setline DSC. 00040001000005 was sent 2.0 s after Calisto's own zone start; 00040001000002 appears in this capture only from the previous run, since this one outlasted the recording. Each is sent once, hence start_streak 1, and there is no quiet timeout because Calisto polls continuously between runs.\n\nNot on the wire: the mass-spectrometer channels that appear in the Calisto export as 18(A), 2(A), 4(A), 32(A), 44(A), 28(A), 40(A). Those reach Calisto through a file written by Questor5, not over the network, and no search of either instrument's traffic will find them. Use File > Merge a vendor export into a session for those.\n\nThe two pressures Calisto shows in its Pressure panel are not in its export, so they were identified by value rather than by correlation. 000100140002 read as float32 big-endian at offset 6 is the only field anywhere in the capture that sits in a pressure range at all: 1431.05 to 1600.00 mBar over the run, against the 1525 mBar the panel shows at idle. The only other 1000-2000 value in the whole capture is a constant 1000.0, which is the programme's final temperature.\n\nWhat ties the family together is 000100140000: read the same way it reproduces Calisto's Carrier Gas Flow with a median difference of 0.000000 over 42,649 samples. So 00010014xxxx is the gas panel, and its four indices are the four things Calisto groups there, in order - carrier flow, auxiliary flow, carrying pressure, protective pressure. Indices 0000 and 0001 match the export's two flow columns (20.0 and 0.0 ml/min), 0002 is the carrying pressure above.\n\nprotective_gas_pressure at 000100140003 is the one signal here identified by position rather than by evidence. It is constant zero for the whole run, and so are three other channels, so nothing in the data distinguishes it from them - it is index 3 of a family whose other three are confirmed, matching the fourth item in the panel, which showed 0 mBar. That is a reasonable inference and not a measurement. If protective gas is ever run at pressure, check this channel first; if it stays at zero while the panel does not, it is the wrong one."
 }

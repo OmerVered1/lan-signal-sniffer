@@ -405,12 +405,28 @@ against a Calisto row of `25.557554 / 22.730051 / …` — bit-exact on five of
 seven, and replaying the whole run through the decoder gives **RMSE 0.16 °C** on
 temperature, the residual being Calisto's own 3.3 s logging interval.
 
-Two things about it are worth knowing, because both are traps:
+It carries twelve signals, two of which Calisto shows on screen but never puts
+in its export — the carrying and protective gas pressures. Those were found by
+value rather than by correlation: `000100140002` is the only field anywhere in
+the capture sitting in a pressure range, 1431–1600 mBar against the 1525 mBar
+the panel reads at idle. What ties the family together is its neighbour
+`000100140000`, which read the same way reproduces Calisto's Carrier Gas Flow to
+a median difference of 0.000000 — so `00010014xxxx` is the gas panel, and its
+four indices are the four things Calisto groups there.
+
+Three things about it are worth knowing, because all three are traps:
 
 * That channel answers in **two shapes** — a 6-byte "nothing new" ack and the
   full frame — and the ack is the more common of the two (29,723 against
   12,925). Anything that analyses only a channel's most common reply length
   keeps the acks and throws away every reading.
+* `protective_gas_pressure` is the one signal in this repository identified by
+  **position rather than by evidence**. It is constant zero for the whole run,
+  and so are three other channels, so nothing in the data separates it from
+  them — it is index 3 of a family whose other three are confirmed, matching the
+  fourth item in a panel that showed 0 mBar. The profile's notes say so. If
+  protective gas is ever run at pressure and this channel stays at zero, it is
+  the wrong one.
 * `sample_temperature` carries `bias: 3.0` deliberately. The wire runs exactly
   3.000000 °C below what Calisto displays — a probe calibration applied inside
   Calisto — and the profile reproduces what Calisto shows, because that is the
