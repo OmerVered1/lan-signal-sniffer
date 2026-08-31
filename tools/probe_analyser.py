@@ -125,6 +125,28 @@ def summarise(reply: bytes) -> str:
 
 def cmd_list(args) -> int:
     found = load(args)
+    greeting = _handshake(args)
+    if greeting:
+        print(f"GOOD: this capture holds the connection opening - "
+              f"{len(greeting)} frame(s), {sum(len(f) for f in greeting)} bytes.")
+        for frame in greeting[:6]:
+            print(f"   {frame.hex()[:96]}")
+        print()
+    else:
+        print(
+            "NO CONNECTION OPENING IN THIS CAPTURE.\n"
+            "\n"
+            "The recording joined a conversation already in progress, so the\n"
+            "greeting the vendor software sends when it first connects is not\n"
+            "here. An instrument that answers nothing when probed is usually\n"
+            "waiting for exactly that greeting.\n"
+            "\n"
+            "To catch it the vendor software has to connect while you are\n"
+            "already recording. Start the capture with the software CLOSED and\n"
+            "check the packet counter stays near zero - if packets are already\n"
+            "streaming, something still holds the connection and opening the\n"
+            "software again will not produce a new one.\n"
+        )
     if args.save:
         Path(args.save).write_text(
             json.dumps(
