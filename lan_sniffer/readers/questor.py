@@ -346,14 +346,23 @@ class QuestorClient:
         self.last_error = ""
 
         if self.since is None and results:
-            # The oldest of the first reply is where this recording begins:
-            # anything at or before it happened before anyone was watching.
-            self.since = results[0].when
+            # The whole of the first reply is history. Every poll asks for
+            # several so a late one can catch up, so the first one hands back
+            # whatever the instrument already had - readings that happened
+            # before anyone was watching. Keeping the oldest of them as the
+            # boundary kept the rest, which is how measurements from twenty
+            # seconds before a session ended up inside it with a negative
+            # elapsed time. The boundary is the newest of that reply, and only
+            # what comes after it belongs to this recording.
+            self.since = max(r.when for r in results)
+            for result in results:
+                self._seen.add(result.key)
+            return []
 
         fresh = [
             r for r in results
             if r.key not in self._seen
-            and (self.since is None or r.when >= self.since)
+            and (self.since is None or r.when > self.since)
         ]
         for result in fresh:
             self._seen.add(result.key)

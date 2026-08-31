@@ -47,6 +47,9 @@ class SessionCSVWriter:
     _t0: Optional[float] = None
     rows_written: int = 0
 
+    _out_of_order: bool = False
+    _last_elapsed: float = float("-inf")
+
     def __post_init__(self) -> None:
         self.path = Path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,11 +91,59 @@ class SessionCSVWriter:
             self._flush()
 
     def close(self) -> None:
-        """Write any partial row and release the file."""
+        """Write any partial row, put the rows in order, and release the file."""
         self._flush()
         if self._handle is not None:
             self._handle.close()
             self._handle = None
+        if self._out_of_order:
+            self._sort_by_time()
+
+    def _sort_by_time(self) -> None:
+        """Order the rows by when they happened, and re-base the elapsed column.
+
+        Nothing is changed but the order: every row keeps its own timestamp and
+        its own values. It has to happen at the end rather than as rows arrive,
+        because a reading that belongs earlier can turn up at any point until
+        the session stops.
+
+        The elapsed column is re-based on the earliest row rather than the
+        first one written, which is what produced negative elapsed times when
+        an instrument's first results predated the run.
+        """
+        import csv as _csv
+
+        try:
+            with self.path.open(newline="", encoding="utf-8") as handle:
+                rows = list(_csv.reader(handle))
+        except OSError:
+            return
+        if len(rows) < 3:
+            return
+        header, body = rows[0], rows[1:]
+
+        def when(row):
+            try:
+                return float(row[1])
+            except (IndexError, ValueError):
+                return 0.0
+
+        body.sort(key=when)
+        base = when(body[0])
+        for row in body:
+            try:
+                row[1] = f"{float(row[1]) - base:.3f}"
+            except (IndexError, ValueError):
+                continue
+        try:
+            with self.path.open("w", newline="", encoding="utf-8") as handle:
+                writer = _csv.writer(handle)
+                writer.writerow(header)
+                writer.writerows(body)
+        except OSError:
+            # The rows are all present and correctly stamped either way; only
+            # their order would be lost, which is not worth losing the file for.
+            return
 
     # ----- internals -----------------------------------------------------
 
@@ -113,6 +164,13 @@ class SessionCSVWriter:
                 row.append(value)
             else:
                 row.append(f"{value:.9g}")
+        if elapsed < self._last_elapsed:
+            # A reading can only be written once it has arrived, and one
+            # instrument's results arrive seconds after the moment they
+            # describe. That leaves the file out of order, which no analysis
+            # expects, so it is sorted when the session closes.
+            self._out_of_order = True
+        self._last_elapsed = max(self._last_elapsed, elapsed)
         self._writer.writerow(row)
         if self._handle is not None:
             self._handle.flush()

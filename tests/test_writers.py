@@ -244,3 +244,41 @@ def test_an_older_reading_does_not_join_the_row_that_is_open(tmp_path):
     assert stamped[0].endswith("16:16.000"), (
         f"it must carry its own time, not the open row's: {stamped[0]}"
     )
+
+
+def test_rows_are_in_time_order_when_the_session_closes(tmp_path):
+    """One instrument's results arrive seconds after the moment they describe.
+
+    Written as they arrive, the file is out of order and its elapsed column
+    counts backwards in places. Nothing is changed but the order: every row
+    keeps its own timestamp and its own values.
+    """
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temperature", "concentration"]) as w:
+        w.add(1000.0, {"temperature": 20.0})
+        w.add(1008.0, {"temperature": 20.2})
+        w.add(1004.0, {"concentration": 1.5})   # arrives late, belongs between
+        w.add(1012.0, {"temperature": 20.3})
+
+    rows = [r.split(",") for r in path.read_text(encoding="utf-8").splitlines()[1:]]
+    stamps = [r[0] for r in rows]
+    assert stamps == sorted(stamps), stamps
+    elapsed = [float(r[1]) for r in rows]
+    assert elapsed == sorted(elapsed)
+    assert elapsed[0] == 0.0, "elapsed counts from the earliest row"
+    assert min(elapsed) >= 0.0, "no row may sit before the start of the run"
+    assert any("1.5" in r for r in rows), "the late reading is still there"
+
+
+def test_a_file_already_in_order_is_left_alone(tmp_path):
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temperature"]) as w:
+        for i in range(4):
+            w.add(1000.0 + i, {"temperature": 20.0 + i})
+    rows = path.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 5
+    assert [float(r.split(",")[1]) for r in rows[1:]] == [0.0, 1.0, 2.0, 3.0]

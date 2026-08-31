@@ -288,6 +288,18 @@ does not.
 A device read this way never opens or closes a session. Questor is always
 acquiring and has no notion of an experiment, so the run belongs to the oven.
 
+Two consequences worth knowing before reading the file:
+
+* **Its first reply is history and is not recorded.** Each poll asks for
+  several results so a late one can catch up, so the first hands back whatever
+  the instrument already had — readings from before anyone was watching. They
+  are real measurements, but they are not part of the run.
+* **Its rows are sparser than a sniffed instrument's**, and its readings arrive
+  a few seconds after the moment they describe. Blank cells are correct: the
+  instrument did not report at that instant, and nothing is interpolated. The
+  session is sorted into time order when it closes, so a reading that belongs
+  earlier ends up there.
+
 ## Asking an instrument directly
 
 `tools/probe_analyser.py` is the one thing here that transmits, and it exists

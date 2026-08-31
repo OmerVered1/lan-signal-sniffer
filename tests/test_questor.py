@@ -117,12 +117,49 @@ def response_with(stamps):
     return REAL[: REAL.index(b"<ResultSet>")] + body + REAL[REAL.index(b"</Lazarus:GetResultsetsResponse>"):]
 
 
-def client_with(responses):
+HISTORY = "2026-08-31T13:19:00.000"
+
+
+def client_with(responses, prime=True):
+    """A client, optionally past its first reply.
+
+    The first reply is always history - whatever the instrument already had
+    before anyone asked - so a client that has not made it is not in the state
+    the app runs in. Tests that care about live readings prime first.
+    """
     from lan_sniffer.readers.questor import QuestorClient
 
     c = QuestorClient()
+    if prime:
+        responses = [response_with([HISTORY])] + list(responses)
     c.transport = FakeTransport(responses)
+    if prime:
+        assert c.poll() == [], "the first reply is history and belongs to nobody"
     return c
+
+
+def test_the_first_reply_is_history_and_is_not_recorded():
+    """It reaches back before the app was watching.
+
+    Those are real measurements, but not part of this recording - and keeping
+    them put readings from twenty seconds before a session inside it, with a
+    negative elapsed time.
+    """
+    c = client_with([], prime=False)
+    c.transport = FakeTransport([
+        response_with([
+            "2026-08-31T13:18:51.637",
+            "2026-08-31T13:18:59.526",
+            "2026-08-31T13:19:07.339",
+        ]),
+        response_with([
+            "2026-08-31T13:18:59.526",
+            "2026-08-31T13:19:07.339",
+            "2026-08-31T13:19:15.122",
+        ]),
+    ])
+    assert c.poll() == []
+    assert [r.when.strftime("%H:%M:%S") for r in c.poll()] == ["13:19:15"]
 
 
 def test_a_result_is_returned_once_and_not_again():
@@ -174,12 +211,14 @@ def test_a_failed_poll_reports_itself_and_does_not_lose_the_history():
 
 
 def test_the_same_instant_on_two_valves_is_two_measurements():
-    one = REAL[REAL.index(b"<ResultSet>") : REAL.index(b"</ResultSet>") + 12]
-    two = REAL[: REAL.index(b"<ResultSet>")] + one + one.replace(
+    later = REAL.replace(b"2026-08-31T13:14:35.527", b"2026-08-31T13:19:51.147")
+    one = later[later.index(b"<ResultSet>") : later.index(b"</ResultSet>") + 12]
+    two = later[: later.index(b"<ResultSet>")] + one + one.replace(
         b"<ValveId>1</ValveId>", b"<ValveId>2</ValveId>"
-    ) + REAL[REAL.index(b"</Lazarus:GetResultsetsResponse>"):]
+    ) + later[later.index(b"</Lazarus:GetResultsetsResponse>"):]
     c = client_with([two])
-    assert len(c.poll()) == 2
+    got = c.poll()
+    assert len(got) == 2, "the same instant on two valves is two measurements"
 
 
 def test_the_url_is_built_the_way_the_browser_addresses_it():
@@ -193,13 +232,19 @@ def test_the_url_is_built_the_way_the_browser_addresses_it():
 
 
 def monitor_reading(responses):
+    """A monitor past its priming poll, as start_capture leaves it."""
     from lan_sniffer.monitor import DeviceConfig, DeviceMonitor
     from lan_sniffer.readers.questor import QuestorClient
 
     m = DeviceMonitor(config=DeviceConfig(label="ms", questor_host="localhost"))
-    m.open_questor()
     m.questor = QuestorClient()
-    m.questor.transport = FakeTransport(responses)
+    m.questor.transport = FakeTransport(
+        [response_with([HISTORY])] + list(responses)
+    )
+    # start_capture asks once to learn the tag names, and drops the readings:
+    # nothing is recording yet, and that reply is history.
+    for entry in m.questor.poll():
+        pass
     m._next_questor = 0.0
     return m
 
@@ -238,7 +283,9 @@ def test_it_is_not_asked_faster_than_it_answers():
     m.config.questor_interval_s = 60.0
     assert len(m.poll().samples) == 1
     assert m.poll().samples == []
-    assert len(m.questor.transport.sent) == 1
+    # One priming request at start-up, then one poll. The rate gate stops the
+    # rest.
+    assert len(m.questor.transport.sent) == 2
 
 
 def test_a_questor_device_never_drives_a_session():
@@ -253,34 +300,8 @@ def test_a_questor_device_never_drives_a_session():
 # ----- what belongs in this recording ----------------------------------------
 
 
-def test_results_from_before_we_started_looking_are_not_recorded():
-    """Every poll asks for several, so the first reply reaches back in time.
-
-    Those are real measurements, but they happened before anyone was watching,
-    and writing them into a session would put readings in it that predate it.
-    """
-    c = client_with([
-        response_with([
-            "2026-08-31T13:19:22.809",
-            "2026-08-31T13:19:30.730",
-            "2026-08-31T13:19:38.589",
-        ]),
-        response_with([
-            "2026-08-31T13:19:30.730",
-            "2026-08-31T13:19:38.589",
-            "2026-08-31T13:19:46.433",
-        ]),
-    ])
-    first = c.poll()
-    # The oldest of the first reply is where this recording begins.
-    assert [r.when.strftime("%H:%M:%S") for r in first] == [
-        "13:19:22", "13:19:30", "13:19:38",
-    ]
-    assert [r.when.strftime("%H:%M:%S") for r in c.poll()] == ["13:19:46"]
-
-
-def test_a_reset_starts_the_history_again():
-    c = client_with([response_with(["2026-08-31T13:19:22.809"])] * 2)
+def test_a_reset_makes_the_next_reply_the_new_history():
+    c = client_with([response_with(["2026-08-31T13:19:22.809"])] * 3)
     assert len(c.poll()) == 1
     c.reset()
-    assert len(c.poll()) == 1, "after a reset the next reply is the new baseline"
+    assert c.poll() == [], "after a reset the next reply is history again"

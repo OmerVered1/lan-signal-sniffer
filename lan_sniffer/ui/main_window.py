@@ -518,11 +518,17 @@ class MainWindow(QMainWindow):
         # Only a device that is watched needs the capture driver. A setup made
         # entirely of instruments read over Modbus should not demand Npcap, or
         # administrator rights, for something it never uses.
-        if any(not m.reads_registers for m in self._monitors) and not self._capture_ready:
+        sniffed = [
+            m for m in self._monitors if not m.reads_registers and not m.reads_questor
+        ]
+        if sniffed and not self._capture_ready:
             QMessageBox.warning(self, "Capture unavailable", self._readiness.text())
             return
 
-        unset = [m.name for m in self._monitors if not m.config.ip]
+        # Only the devices that are watched or polled by address need one. A
+        # device read from its own software is addressed by hostname in its own
+        # dialog, and demanding an IP here made it look misconfigured.
+        unset = [m.name for m in self._monitors if not m.config.ip and not m.reads_questor]
         if unset:
             QMessageBox.warning(
                 self,
@@ -533,7 +539,11 @@ class MainWindow(QMainWindow):
 
         started: List[DeviceMonitor] = []
         for monitor in self._monitors:
-            interface = monitor.config.interface or interface_for(monitor.config.ip)
+            interface = (
+                monitor.config.interface or interface_for(monitor.config.ip)
+                if monitor.config.ip
+                else None
+            )
             try:
                 monitor.start_capture(interface)
             except Exception as e:
