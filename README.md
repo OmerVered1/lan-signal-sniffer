@@ -170,8 +170,11 @@ fast one.
 
 On the same recording that turns 2 rows into 64.
 
-Uncheck **Repeat the last reading to fill gaps** to record only what was
-measured at each instant. The `.raw.jsonl` holds the untouched traffic either
+**Leave "Repeat the last reading to fill gaps" ticked** unless you specifically
+want otherwise — unticked, two instruments in one file will barely ever share a
+row, which is what the setting exists to fix.
+
+Uncheck it to record only what was measured at each instant. The `.raw.jsonl` holds the untouched traffic either
 way.
 
 ### Naming a session

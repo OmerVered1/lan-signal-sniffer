@@ -70,16 +70,63 @@ def draw(size: int) -> Image.Image:
     return img.resize((size, size), Image.LANCZOS)
 
 
+# Sizes a Windows shell actually asks for, and the format each must be in.
+# Explorer renders a PNG-compressed entry reliably only at 256x256; at the
+# smaller sizes - a taskbar, a desktop shortcut, a title bar - it wants a
+# classic BMP and falls back to a generic icon when it does not get one.
+# Pillow writes PNG for every size by default, which is why the shortcut showed
+# a blank page while the app's own window icon looked right.
+BMP_SIZES = (16, 24, 32, 48, 64, 128)
+PNG_SIZE = 256
+
+
+def write_ico(path: Path) -> None:
+    """Write an .ico with BMP entries for the small sizes and PNG at 256.
+
+    Assembled here rather than left to one `save` call because the two formats
+    have to be mixed and Pillow chooses one for the whole file. A 256x256 BMP
+    would work but costs a quarter of a megabyte on its own, and PNG at that
+    size is what every Windows icon has used since Vista.
+    """
+    import io
+    import struct
+
+    entries = []
+    for size in BMP_SIZES:
+        buffer = io.BytesIO()
+        draw(size).save(buffer, format="ICO", sizes=[(size, size)], bitmap_format="bmp")
+        entries.append((size, _payload(buffer.getvalue())))
+    buffer = io.BytesIO()
+    draw(PNG_SIZE).save(buffer, format="PNG")
+    entries.append((PNG_SIZE, buffer.getvalue()))
+
+    offset = 6 + 16 * len(entries)
+    directory, blobs = b"", b""
+    for size, blob in entries:
+        directory += struct.pack(
+            "<BBBBHHII",
+            0 if size >= 256 else size,
+            0 if size >= 256 else size,
+            0, 0, 1, 32, len(blob), offset,
+        )
+        blobs += blob
+        offset += len(blob)
+    path.write_bytes(struct.pack("<HHH", 0, 1, len(entries)) + directory + blobs)
+
+
+def _payload(single: bytes) -> bytes:
+    """The image bytes out of a one-entry .ico Pillow just wrote."""
+    import struct
+
+    size, offset = struct.unpack("<II", single[14:22])
+    return single[offset : offset + size]
+
+
 def main() -> None:
     png = HERE / "app_icon.png"
     draw(1024).save(png)
 
-    ico_sizes = [16, 24, 32, 48, 64, 128, 256]
-    draw(256).save(
-        HERE / "app_icon.ico",
-        format="ICO",
-        sizes=[(s, s) for s in ico_sizes],
-    )
+    write_ico(HERE / "app_icon.ico")
 
     with tempfile.TemporaryDirectory() as tmp:
         iconset = Path(tmp) / "app_icon.iconset"
