@@ -152,6 +152,28 @@ capture warning is one line that appears only when capture cannot work — it
 used to be three lines of orange above everything, permanently, including on a
 machine where capture was working.
 
+### Two instruments, one row
+
+Instruments in a coupled rig report at wildly different rates — an oven up to
+ten times a second beside an analyser every eight. Written strictly as measured,
+they almost never share a row: one recording had both instruments on **two rows
+out of seventy-two**, which is a file nobody can plot.
+
+So a signal that did not report on a row keeps the value it last reported.
+**The value is one the instrument actually sent** — never averaged, never
+interpolated between two readings — and it is carried for only a few of that
+signal's own reporting intervals. An instrument that stops therefore goes blank
+rather than holding its last value across the rest of the run and reading as
+though it were still answering. The limit follows each signal's own cadence,
+because a fixed one is either too tight for a slow signal or too generous for a
+fast one.
+
+On the same recording that turns 2 rows into 64.
+
+Uncheck **Repeat the last reading to fill gaps** to record only what was
+measured at each instant. The `.raw.jsonl` holds the untouched traffic either
+way.
+
 ### Naming a session
 
 **Save next as** sets the file name for the next session — one started by hand

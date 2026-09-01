@@ -25,6 +25,22 @@ from typing import Dict, List, Optional, Sequence, TextIO
 # out does not stall the file.
 DEFAULT_ROW_TIMEOUT = 5.0
 
+# A reading is carried into later rows for this many times its own reporting
+# interval. Instruments in one rig report at wildly different rates - an oven
+# ten times a second beside an analyser every eight seconds - and without this
+# the two never share a row: 72 rows of one recording had both instruments on
+# two of them.
+#
+# It is a multiple of each signal's own cadence rather than a fixed time
+# because a fixed one is either too tight for a slow signal or too generous for
+# a fast one. Three intervals tolerates a missed reply and no more.
+CARRY_INTERVALS = 3.0
+# Below this, cadence is too short to be a useful limit on its own.
+CARRY_FLOOR_S = 5.0
+# Above this nothing is carried, whatever its cadence. A reading a minute old
+# is history, not the current state of an instrument.
+CARRY_CEILING_S = 120.0
+
 
 @dataclass
 class SessionCSVWriter:
@@ -39,6 +55,11 @@ class SessionCSVWriter:
     signal_names: Sequence[str]
     units: Dict[str, str] = field(default_factory=dict)
     row_timeout: float = DEFAULT_ROW_TIMEOUT
+    # Whether a signal that did not report on this row keeps the value it last
+    # reported. Off, every row holds only what was measured at that instant,
+    # which is the truth but leaves two instruments in one file that never
+    # share a row.
+    carry_forward: bool = True
 
     _handle: Optional[TextIO] = None
     _writer: Optional[object] = None
@@ -49,6 +70,12 @@ class SessionCSVWriter:
 
     _out_of_order: bool = False
     _last_elapsed: float = float("-inf")
+    # The most recent reading of each signal, when it was taken, and how often
+    # that signal reports - which is what decides how long it may be carried.
+    _held: Dict[str, object] = field(default_factory=dict)
+    _held_at: Dict[str, float] = field(default_factory=dict)
+    _cadence: Dict[str, float] = field(default_factory=dict)
+    carried_cells: int = 0
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
@@ -86,9 +113,47 @@ class SessionCSVWriter:
         if self._row_ts is None:
             self._row_ts = ts
         self._row.update(values)
+        self._remember(ts, values)
 
         if all(name in self._row for name in self.signal_names):
             self._flush()
+
+    def _remember(self, ts: float, values: Dict[str, object]) -> None:
+        """Keep each signal's newest reading, and learn how often it reports."""
+        for name, value in values.items():
+            previous = self._held_at.get(name)
+            if previous is not None and ts > previous:
+                gap = ts - previous
+                known = self._cadence.get(name)
+                # A running average rather than the last gap alone: one late
+                # reply should not double the time its signal may be carried.
+                self._cadence[name] = gap if known is None else (known * 3 + gap) / 4
+            self._held[name] = value
+            self._held_at[name] = ts
+
+    def _carry_into(self, row: Dict[str, object], row_ts: float) -> None:
+        """Fill a row's gaps with each signal's last reading, while it is current.
+
+        The value written is one the instrument actually reported - never an
+        average, never interpolated between two. What makes it honest is the
+        limit: a reading is only carried for a few of its own reporting
+        intervals, so a signal that has stopped goes blank rather than holding
+        its last value across the rest of the run and reading as though the
+        instrument were still answering.
+        """
+        for name in self.signal_names:
+            if name in row or name not in self._held:
+                continue
+            age = row_ts - self._held_at.get(name, row_ts)
+            if age < 0:
+                # The row predates this reading; carrying it backwards would
+                # claim a measurement before it was taken.
+                continue
+            cadence = self._cadence.get(name, self.row_timeout)
+            limit = min(max(cadence * CARRY_INTERVALS, CARRY_FLOOR_S), CARRY_CEILING_S)
+            if age <= limit:
+                row[name] = self._held[name]
+                self.carried_cells += 1
 
     def close(self) -> None:
         """Write any partial row, put the rows in order, and release the file."""
@@ -150,6 +215,8 @@ class SessionCSVWriter:
     def _flush(self) -> None:
         if not self._row or self._writer is None or self._row_ts is None:
             return
+        if self.carry_forward:
+            self._carry_into(self._row, self._row_ts)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(self._row_ts))
         fractional = self._row_ts - int(self._row_ts)
         elapsed = self._row_ts - (self._t0 if self._t0 is not None else self._row_ts)

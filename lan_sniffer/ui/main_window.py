@@ -343,6 +343,21 @@ class MainWindow(QMainWindow):
         self._name_preview.setStyleSheet(_muted_style(self._dark))
         self._name_preview.setWordWrap(True)
 
+        # Two instruments in one rig report at wildly different rates, and
+        # without this they never share a row: one recording had both on two
+        # rows out of seventy-two.
+        self._carry = QCheckBox("Repeat the last reading to fill gaps")
+        self._carry.setChecked(True)
+        self._carry.setToolTip(
+            "A signal that did not report on a row keeps the value it last\n"
+            "reported, so every row holds a complete picture.\n\n"
+            "The value is one the instrument actually sent - never averaged,\n"
+            "never interpolated - and it is only carried for a few of that\n"
+            "signal's own reporting intervals, so an instrument that stops\n"
+            "goes blank rather than appearing to still answer.\n\n"
+            "Turn this off to record only what was measured at each instant."
+        )
+
         naming = QFormLayout()
         naming.setContentsMargins(0, 0, 0, 0)
         naming.addRow("Save next as", self._next_name)
@@ -356,6 +371,7 @@ class MainWindow(QMainWindow):
         for button in (self._start_btn, self._stop_btn, self._split_btn):
             buttons.addWidget(button)
         session.addLayout(buttons)
+        session.addWidget(self._carry)
         session.addLayout(naming)
         session.addWidget(self._name_preview)
         session.addWidget(self._output_label)
@@ -1132,7 +1148,10 @@ class MainWindow(QMainWindow):
             units.update(monitor.units())
         try:
             self._csv = SessionCSVWriter(
-                base.with_suffix(".csv"), names, units
+                base.with_suffix(".csv"),
+                names,
+                units,
+                carry_forward=self._carry.isChecked(),
             )
             self._raw = RawWriter(
                 Path(str(base) + ".raw.jsonl"),

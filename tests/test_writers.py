@@ -282,3 +282,76 @@ def test_a_file_already_in_order_is_left_alone(tmp_path):
     rows = path.read_text(encoding="utf-8").splitlines()
     assert len(rows) == 5
     assert [float(r.split(",")[1]) for r in rows[1:]] == [0.0, 1.0, 2.0, 3.0]
+
+
+# ----- two instruments that report at different rates ------------------------
+
+
+def test_a_slower_instrument_still_appears_on_every_row(tmp_path):
+    """The complaint this fixes: an oven at 1 Hz and an analyser every 7 s
+    shared a row twice in seventy-two."""
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["oven.temp", "ms.o2"]) as w:
+        w.add(0.0, {"ms.o2": 72.1})
+        for i in range(1, 8):
+            w.add(float(i), {"oven.temp": 100.0 + i})
+        w.add(8.0, {"ms.o2": 72.4})
+
+    rows = [r.split(",") for r in path.read_text(encoding="utf-8").splitlines()[1:]]
+    with_both = [r for r in rows if r[2] and r[3]]
+    assert len(with_both) >= 6, rows
+    # The carried value is the one actually reported, not an average of the two.
+    assert all(r[3] in ("72.1", "72.4") for r in rows if r[3])
+
+
+def test_a_reading_is_not_carried_once_it_is_stale(tmp_path):
+    """An instrument that stops must go blank, not hold its last value.
+
+    Holding it would read as an instrument still answering, which is the one
+    thing worse than a gap.
+    """
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["oven.temp", "ms.o2"]) as w:
+        w.add(0.0, {"ms.o2": 72.1})
+        w.add(1.0, {"ms.o2": 72.2})   # cadence: about one second
+        for i in range(2, 40):
+            w.add(float(i), {"oven.temp": 100.0 + i})
+
+    rows = [r.split(",") for r in path.read_text(encoding="utf-8").splitlines()[1:]]
+    assert rows[-1][3] == "", "a long-dead signal must not still be reported"
+    filled = [r for r in rows if r[3]]
+    assert len(filled) < len(rows), "and it must have stopped at some point"
+
+
+def test_a_reading_is_never_carried_backwards(tmp_path):
+    """It would claim a measurement before the instrument took it."""
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["oven.temp", "ms.o2"]) as w:
+        w.add(0.0, {"oven.temp": 100.0})
+        w.add(1.0, {"oven.temp": 101.0})
+        w.add(2.0, {"ms.o2": 72.0})
+
+    rows = [r.split(",") for r in path.read_text(encoding="utf-8").splitlines()[1:]]
+    assert rows[0][3] == "", "the first rows predate the reading"
+
+
+def test_carrying_can_be_turned_off_for_only_what_was_measured(tmp_path):
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["a", "b"], carry_forward=False) as w:
+        w.add(0.0, {"b": 5.0})
+        for i in range(1, 5):
+            w.add(float(i), {"a": float(i)})
+
+    rows = [r.split(",") for r in path.read_text(encoding="utf-8").splitlines()[1:]]
+    # A row may still hold both when the two arrived inside its time budget -
+    # that is the row batching, not a repeat. What must not happen is the one
+    # measurement of b appearing on more than one row.
+    assert sum(1 for r in rows if r[3]) == 1, rows
