@@ -177,6 +177,37 @@ row, which is what the setting exists to fix.
 Uncheck it to record only what was measured at each instant. The `.raw.jsonl` holds the untouched traffic either
 way.
 
+### One row per experiment sample
+
+**Follow experiment sample rate** writes a row every time one chosen signal
+reports, and at no other moment — so the table has one row per sample of the
+experiment, with no empty rows and no empty cells.
+
+The rate belongs to a **signal**, not to a device. A Setaram answers its status
+frame at whatever rate Calisto was told to log at, while its other channels poll
+at their own pace regardless — so `sample_temperature` is the default anchor,
+because its cadence *is* the experiment plan. Any signal can be chosen instead.
+
+Anchoring this way means the primary measurement is the one value in each row
+that is never held. Everything else carries its last actual reading, subject to
+the same staleness rule as anywhere else, and a signal reporting faster than the
+rows contributes its most recent reading — never an average, so every cell stays
+a number the instrument sent.
+
+Two edges worth knowing:
+
+* **The first rows are held back** until every signal has reported once,
+  because writing them would put back the empty cells this exists to remove.
+  The wait ends as soon as the last signal joins, or sooner than a misconfigured
+  device can cost you the opening minutes — once nothing new has arrived for a
+  few seconds, the rows come out with the gap showing.
+* **No run in progress means no rows.** A Setaram does not poll its status frame
+  between experiments, so nothing anchors the file. The window says so rather
+  than looking like a hung recording.
+
+Replaying a real recording through it: 357 samples of the anchoring signal give
+342 rows and **zero empty cells** in every column that ever reported.
+
 ### Naming a session
 
 **Save next as** sets the file name for the next session — one started by hand

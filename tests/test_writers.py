@@ -355,3 +355,151 @@ def test_carrying_can_be_turned_off_for_only_what_was_measured(tmp_path):
     # that is the row batching, not a repeat. What must not happen is the one
     # measurement of b appearing on more than one row.
     assert sum(1 for r in rows if r[3]) == 1, rows
+
+
+# ----- one row per experiment sample -----------------------------------------
+
+
+def rows_of(path):
+    return [r.split(",") for r in path.read_text(encoding="utf-8").splitlines()[1:]]
+
+
+def test_a_row_is_written_when_the_anchoring_signal_reports(tmp_path):
+    """The rate belongs to the signal: a Setaram answers its status frame at
+    whatever rate Calisto was told to log at."""
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temp", "o2"], follow="temp") as w:
+        w.add(0.0, {"o2": 72.0})
+        for i in range(4):
+            w.add(float(i) * 3, {"temp": 100.0 + i})
+
+    rows = rows_of(path)
+    assert len(rows) == 4, rows
+    assert [r[1] for r in rows] == ["0.000", "3.000", "6.000", "9.000"]
+
+
+def test_the_anchoring_signal_is_never_a_held_value(tmp_path):
+    """It is the reading the row exists for; holding it would resample the one
+    measurement that does not need it."""
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temp", "o2"], follow="temp") as w:
+        w.add(0.0, {"o2": 72.0})
+        w.add(0.0, {"temp": 100.0})
+        w.add(3.0, {"temp": 101.5})
+
+    assert [r[2] for r in rows_of(path)] == ["100", "101.5"]
+
+
+def test_a_faster_signal_contributes_its_last_reading_before_the_row(tmp_path):
+    """No averaging: every cell stays a number the instrument actually sent."""
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temp", "fast"], follow="temp") as w:
+        w.add(0.0, {"fast": 1.0})
+        w.add(0.0, {"temp": 100.0})
+        for i in range(1, 10):
+            w.add(i * 0.1, {"fast": 1.0 + i})
+        w.add(1.0, {"temp": 101.0})
+
+    rows = rows_of(path)
+    assert rows[-1][3] == "10", "the newest reading before the row, not a mean"
+
+
+def test_no_row_is_written_before_every_signal_has_reported(tmp_path):
+    """Emitting them would put back the empty cells anchoring exists to remove."""
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temp", "o2"], follow="temp") as w:
+        w.add(0.0, {"temp": 100.0})
+        w.add(3.0, {"temp": 101.0})
+        assert w.waiting_for == ["o2"]
+        w.add(4.0, {"o2": 72.0})
+        w.add(6.0, {"temp": 102.0})
+
+    rows = rows_of(path)
+    assert len(rows) == 1, "only the row after o2 first reported"
+    assert all(cell for cell in rows[0]), rows[0]
+
+
+def test_a_signal_that_never_reports_does_not_silence_the_file(tmp_path):
+    """A misconfigured device must not cost the whole recording."""
+    from lan_sniffer.writers.csv_writer import SETTLE_S, SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temp", "never"], follow="temp") as w:
+        w.add(0.0, {"temp": 100.0})
+        w.add(SETTLE_S - 1, {"temp": 101.0})
+        assert not rows_of(path), "still hoping it will answer"
+        w.add(SETTLE_S + 1, {"temp": 102.0})
+
+    rows = rows_of(path)
+    assert len(rows) == 1, "the wait ends once nothing new is arriving"
+    assert rows[0][3] == "", "and the gap shows rather than being invented"
+
+
+def test_the_wait_ends_as_soon_as_the_last_signal_joins(tmp_path):
+    """The common case: an analyser simply slower to answer than the oven."""
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temp", "o2"], follow="temp") as w:
+        for i in range(12):
+            w.add(float(i), {"temp": 100.0 + i})
+            if i == 3:
+                w.add(float(i), {"o2": 72.0})
+
+    rows = rows_of(path)
+    # From the row after o2 first reported - the one at i == 3 was written
+    # before it, in the same instant.
+    assert len(rows) == 8, len(rows)
+    assert all(all(cell for cell in r) for r in rows)
+
+
+def test_a_signal_that_stops_goes_blank_rather_than_repeating(tmp_path):
+    """A dead instrument must not look alive."""
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temp", "o2"], follow="temp") as w:
+        # Interleaved in time, as a real run delivers them: the analyser
+        # answers twice and then stops while the oven carries on.
+        for i in range(40):
+            w.add(float(i), {"temp": 100.0 + i})
+            if i < 2:
+                w.add(float(i), {"o2": 72.0 + i})
+
+    rows = rows_of(path)
+    assert rows[0][3], "it was reporting at the start"
+    assert rows[-1][3] == "", "and had stopped by the end"
+
+
+def test_a_late_older_reading_does_not_displace_a_newer_one(tmp_path):
+    """A device answering with a short history delivers old after new."""
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temp", "o2"], follow="temp") as w:
+        w.add(5.0, {"o2": 72.5})
+        w.add(1.0, {"o2": 70.0})          # older, arriving late
+        w.add(6.0, {"temp": 100.0})
+
+    assert rows_of(path)[0][3] == "72.5"
+
+
+def test_a_batched_reply_yields_a_row_for_each_of_its_readings(tmp_path):
+    """Ten records in one frame is the instrument reporting ten times."""
+    from lan_sniffer.writers.csv_writer import SessionCSVWriter
+
+    path = tmp_path / "s.csv"
+    with SessionCSVWriter(path, ["temp", "o2"], follow="temp") as w:
+        w.add(0.0, {"o2": 72.0})
+        for i in range(10):
+            w.add(i * 0.1, {"temp": 100.0 + i})
+
+    assert len(rows_of(path)) == 10

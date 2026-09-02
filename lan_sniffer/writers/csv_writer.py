@@ -41,6 +41,14 @@ CARRY_FLOOR_S = 5.0
 # is history, not the current state of an instrument.
 CARRY_CEILING_S = 120.0
 
+# How long the first rows are held back waiting for a signal that has not
+# reported yet, measured from the last time a *new* signal appeared. Rows are
+# withheld so the file does not open with the empty cells that anchoring exists
+# to remove - but a device that is misconfigured and will never answer must not
+# cost the opening minutes of an experiment, so the wait ends once the picture
+# has stopped changing.
+SETTLE_S = 15.0
+
 
 @dataclass
 class SessionCSVWriter:
@@ -60,6 +68,17 @@ class SessionCSVWriter:
     # which is the truth but leaves two instruments in one file that never
     # share a row.
     carry_forward: bool = True
+    # The signal whose reporting rate is the experiment's own. When set, a row
+    # is written every time it reports and at no other moment, so the table has
+    # one row per experiment sample - the shape an analysis expects and the one
+    # a ragged, arrival-ordered file is not.
+    #
+    # It is a signal rather than a device because the rate belongs to the
+    # signal: a Setaram oven answers its status frame at whatever rate Calisto
+    # was told to log at, while its other channels poll at their own pace
+    # regardless. Anchoring here also means the primary measurement is the one
+    # value in the row that is never held.
+    follow: Optional[str] = None
 
     _handle: Optional[TextIO] = None
     _writer: Optional[object] = None
@@ -76,6 +95,13 @@ class SessionCSVWriter:
     _held_at: Dict[str, float] = field(default_factory=dict)
     _cadence: Dict[str, float] = field(default_factory=dict)
     carried_cells: int = 0
+    # When the anchoring signal first reported, so rows held back waiting for a
+    # silent device are not held back for ever.
+    _first_follow_ts: Optional[float] = None
+    # When a signal last reported for the first time, so the wait ends once no
+    # further signal has joined rather than only on a fixed deadline.
+    _last_new_signal_ts: Optional[float] = None
+    waiting_for: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.path = Path(self.path)
@@ -91,9 +117,14 @@ class SessionCSVWriter:
     # ----- input ---------------------------------------------------------
 
     def add(self, ts: float, values: Dict[str, object]) -> None:
-        """Fold one decoded sample into the open row."""
+        """Fold one decoded sample into the open row, or into the next one."""
         if self._t0 is None:
             self._t0 = ts
+        if self.follow:
+            self._remember(ts, values)
+            if self.follow in values:
+                self._write_followed_row(ts, values)
+            return
 
         # Decide the open row's fate before merging anything into it. A sample
         # that repeats a signal already present belongs to the next cycle, and
@@ -118,16 +149,80 @@ class SessionCSVWriter:
         if all(name in self._row for name in self.signal_names):
             self._flush()
 
+    def _settled(self, ts: float) -> bool:
+        """Whether to stop waiting for signals that have not reported yet.
+
+        Two ways out, because there are two reasons a signal is missing. One is
+        that its instrument is simply slower to answer than the anchor, and the
+        wait ends when it does. The other is that it will never answer at all -
+        a wrong address, an instrument that is off - and that has to end on a
+        clock or the recording never starts.
+        """
+        # `is None`, not truthiness: the first sample of a session is often at
+        # elapsed zero, and `0.0 or fallback` quietly takes the fallback.
+        newest = self._last_new_signal_ts
+        if newest is None:
+            newest = self._first_follow_ts
+        started = self._first_follow_ts
+        since_new = ts - newest if newest is not None else 0.0
+        since_first = ts - started if started is not None else 0.0
+        return since_new >= SETTLE_S or since_first >= CARRY_CEILING_S
+
+    def follow_cadence(self) -> Optional[float]:
+        """How often the anchoring signal is reporting, once it has twice."""
+        return self._cadence.get(self.follow) if self.follow else None
+
+    def _write_followed_row(self, ts: float, values: Dict[str, object]) -> None:
+        """One row, at the moment the experiment took its sample.
+
+        The anchoring signal's own value goes in unmodified - it is the reading
+        this row exists for. Everything else is whatever that signal last
+        reported, subject to the same staleness rule as anywhere else, so an
+        instrument that has stopped leaves a gap rather than a number it is no
+        longer producing.
+        """
+        if self._first_follow_ts is None:
+            self._first_follow_ts = ts
+
+        row: Dict[str, object] = {
+            name: value for name, value in values.items() if name in self.signal_names
+        }
+        self._carry_into(row, ts)
+
+        missing = [name for name in self.signal_names if name not in row]
+        if missing:
+            # Holding the first rows back until every signal has spoken once is
+            # the whole point: emitting them would put the empty cells back
+            # that anchoring is meant to remove. But a device that never
+            # answers must not silence the file for ever, so the wait is
+            # bounded and after it the rows come out with the gaps showing.
+            never = [name for name in missing if name not in self._held]
+            if never and not self._settled(ts):
+                self.waiting_for = never
+                return
+        self.waiting_for = []
+
+        self._row, self._row_ts = row, ts
+        self._flush()
+
     def _remember(self, ts: float, values: Dict[str, object]) -> None:
         """Keep each signal's newest reading, and learn how often it reports."""
         for name, value in values.items():
             previous = self._held_at.get(name)
+            if previous is not None and ts < previous:
+                # An older reading, arriving late. A device that answers with a
+                # short history delivers those after newer ones, and installing
+                # one as "the latest" would hand a stale number to every row
+                # that follows until the next real reading.
+                continue
             if previous is not None and ts > previous:
                 gap = ts - previous
                 known = self._cadence.get(name)
                 # A running average rather than the last gap alone: one late
                 # reply should not double the time its signal may be carried.
                 self._cadence[name] = gap if known is None else (known * 3 + gap) / 4
+            if name not in self._held:
+                self._last_new_signal_ts = ts
             self._held[name] = value
             self._held_at[name] = ts
 
@@ -215,7 +310,9 @@ class SessionCSVWriter:
     def _flush(self) -> None:
         if not self._row or self._writer is None or self._row_ts is None:
             return
-        if self.carry_forward:
+        if self.carry_forward and not self.follow:
+            # An anchored row has already been filled, from the moment it is
+            # anchored to rather than from whenever this flush happens.
             self._carry_into(self._row, self._row_ts)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(self._row_ts))
         fractional = self._row_ts - int(self._row_ts)

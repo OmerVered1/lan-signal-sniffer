@@ -277,3 +277,92 @@ def test_a_broken_capture_says_so_in_one_line(qapp, tmp_path, monkeypatch):
         assert "Install it." in w._readiness_detail
     finally:
         w.close()
+
+
+# ----- following the experiment's sample rate --------------------------------
+
+
+def test_it_is_off_until_asked_for(qapp, tmp_path):
+    w = window(tmp_path)
+    try:
+        assert not w._follow.isChecked()
+        assert not w._follow_signal.isEnabled()
+        assert w._carry.isEnabled()
+    finally:
+        w.close()
+
+
+def test_turning_it_on_retires_the_option_it_replaces(qapp, tmp_path):
+    """An anchored row holds by definition; offering both invites confusion."""
+    w = window(tmp_path)
+    try:
+        w._follow.setChecked(True)
+        assert w._follow_signal.isEnabled()
+        assert not w._carry.isEnabled()
+        assert "Not used while" in w._carry.toolTip()
+    finally:
+        w.close()
+
+
+def test_the_default_anchor_is_the_signal_the_experiment_paces(qapp, tmp_path):
+    """On a Setaram that is sample_temperature: its rate is the logging rate
+    set in the experiment plan."""
+    from lan_sniffer.ui import main_window as mw
+
+    w = window(tmp_path)
+    try:
+        monkey = w._monitors[0]
+        monkey.config.controls_recording = True
+        monkey.signal_names = lambda: [
+            "oven.heat_flow", "oven.sample_temperature", "oven.heater_power"
+        ]
+        w._refresh_follow_choices()
+        assert w._follow_signal.currentText() == "oven.sample_temperature"
+    finally:
+        w.close()
+
+
+def test_a_rig_without_one_falls_back_to_the_driving_device(qapp, tmp_path):
+    w = window(tmp_path)
+    try:
+        monkey = w._monitors[0]
+        monkey.config.controls_recording = True
+        monkey.signal_names = lambda: ["rig.pressure", "rig.flow"]
+        w._refresh_follow_choices()
+        assert w._follow_signal.currentText() == "rig.pressure"
+    finally:
+        w.close()
+
+
+def test_the_chosen_anchor_reaches_the_file(qapp, tmp_path):
+    w = window(tmp_path)
+    try:
+        w._monitors[0].signal_names = lambda: ["oven.sample_temperature"]
+        w._monitors[0].units = lambda: {}
+        w._refresh_follow_choices()
+        w._follow.setChecked(True)
+        w._capturing = True
+        w._open_session(manual=True)
+        assert w._csv is not None
+        assert w._csv.follow == "oven.sample_temperature"
+        w._close_session(manual=True)
+    finally:
+        w.close()
+
+
+def test_a_session_waiting_for_its_anchor_says_why(qapp, tmp_path):
+    """With no run in progress a Setaram never polls its status frame, so no
+    rows appear - and that must not look like a hung recording."""
+    w = window(tmp_path)
+    try:
+        w._monitors[0].signal_names = lambda: ["oven.sample_temperature"]
+        w._monitors[0].units = lambda: {}
+        w._refresh_follow_choices()
+        w._follow.setChecked(True)
+        w._capturing = True
+        w._open_session(manual=True)
+        w._update_session_label()
+        assert "Is a run in progress?" in w._session_label.text()
+        w._close_session(manual=True)
+    finally:
+        w.close()

@@ -348,17 +348,31 @@ class MainWindow(QMainWindow):
         # rows out of seventy-two.
         self._carry = QCheckBox("Repeat the last reading to fill gaps")
         self._carry.setChecked(True)
-        self._carry.setToolTip(
-            "A signal that did not report on a row keeps the value it last\n"
-            "reported, so every row holds a complete picture.\n\n"
-            "The value is one the instrument actually sent - never averaged,\n"
-            "never interpolated - and it is only carried for a few of that\n"
-            "signal's own reporting intervals, so an instrument that stops\n"
-            "goes blank rather than appearing to still answer.\n\n"
-            "Turn this off to record only what was measured at each instant."
+        self._carry.setToolTip(_CARRY_TOOLTIP)
+
+        # Rows anchored to the experiment's own sample rate. The rate belongs
+        # to a signal rather than to a device: a Setaram answers its status
+        # frame at whatever rate Calisto was told to log at, while its other
+        # channels poll at their own pace regardless.
+        self._follow = QCheckBox("Follow experiment sample rate")
+        self._follow.setToolTip(
+            "Write one row every time the chosen signal reports, and at no\n"
+            "other moment - so the table has one row per experiment sample,\n"
+            "with no empty rows and no empty cells.\n\n"
+            "That signal's own value is exact in every row; the others hold\n"
+            "the last reading they actually sent."
         )
+        self._follow.stateChanged.connect(self._on_follow_toggled)
+        self._follow_signal = QComboBox()
+        self._follow_signal.setToolTip(
+            "The signal whose rate is the experiment's. On a Setaram that is\n"
+            "sample_temperature, because its rate is the logging rate set in\n"
+            "the experiment plan."
+        )
+        self._follow_signal.setEnabled(False)
 
         naming = QFormLayout()
+        naming.addRow("Rows follow", self._follow_signal)
         naming.setContentsMargins(0, 0, 0, 0)
         naming.addRow("Save next as", self._next_name)
 
@@ -371,6 +385,7 @@ class MainWindow(QMainWindow):
         for button in (self._start_btn, self._stop_btn, self._split_btn):
             buttons.addWidget(button)
         session.addLayout(buttons)
+        session.addWidget(self._follow)
         session.addWidget(self._carry)
         session.addLayout(naming)
         session.addWidget(self._name_preview)
@@ -1152,6 +1167,11 @@ class MainWindow(QMainWindow):
                 names,
                 units,
                 carry_forward=self._carry.isChecked(),
+                follow=(
+                    self._follow_signal.currentText()
+                    if self._follow.isChecked()
+                    else None
+                ),
             )
             self._raw = RawWriter(
                 Path(str(base) + ".raw.jsonl"),
@@ -1271,7 +1291,9 @@ class MainWindow(QMainWindow):
             target = Path(self._csv.path).name
             if not self._csv.signal_names:
                 target = target[:-4] + ".raw.jsonl" if target.endswith(".csv") else target
-            self._session_label.setText(f"Writing to <code>{target}</code>")
+            self._session_label.setText(
+                f"Writing to <code>{target}</code>{self._follow_note()}"
+            )
             return
 
         # With several devices the panel reports the one still waiting, since
@@ -1402,6 +1424,74 @@ class MainWindow(QMainWindow):
         chosen = _slug(self._next_name.text()) if self._next_name.text().strip() else ""
         return chosen or self._automatic_stem()
 
+    def _on_follow_toggled(self) -> None:
+        """Anchored rows hold by definition, so the other option stops meaning
+        anything while this one is on."""
+        on = self._follow.isChecked()
+        self._follow_signal.setEnabled(on)
+        self._carry.setEnabled(not on)
+        self._carry.setToolTip(
+            "Not used while rows follow the experiment's sample rate: an\n"
+            "anchored row already holds every signal's last reading."
+            if on
+            else _CARRY_TOOLTIP
+        )
+        self._update_session_label()
+
+    def _follow_note(self) -> str:
+        """What is pacing the rows, and whether anything is holding them up.
+
+        With no run in progress a Setaram does not poll its status frame at
+        all, so no rows appear - and without saying why, a recording that is
+        working correctly looks like one that has hung.
+        """
+        writer = self._csv
+        if writer is None or not getattr(writer, "follow", None):
+            return ""
+        anchor = writer.follow.split(".", 1)[-1]
+        waiting = list(getattr(writer, "waiting_for", []))
+        if waiting:
+            names = ", ".join(w.split(".", 1)[-1] for w in waiting[:3])
+            return (
+                f"<br><span style='color:#a04000'>waiting for {names} to report "
+                "before the first row</span>"
+            )
+        if not writer.rows_written:
+            return (
+                f"<br><span style='color:#a04000'>no rows yet — waiting for "
+                f"{anchor}. Is a run in progress?</span>"
+            )
+        cadence = writer.follow_cadence()
+        pace = f" — about every {cadence:.3g} s" if cadence else ""
+        return f"<br>rows follow <b>{anchor}</b>{pace}"
+
+    def _refresh_follow_choices(self) -> None:
+        """Offer every signal, defaulting to the one the experiment paces.
+
+        A Setaram's sample temperature comes from its status frame, which is
+        polled at the logging rate of the run - so it is the right default
+        wherever it exists, and the list is there for a rig built differently.
+        """
+        names = [n for m in self._monitors for n in m.signal_names()]
+        chosen = self._follow_signal.currentText()
+        self._follow_signal.blockSignals(True)
+        self._follow_signal.clear()
+        self._follow_signal.addItems(names)
+        if chosen in names:
+            self._follow_signal.setCurrentText(chosen)
+        else:
+            driver = next(
+                (m for m in self._monitors if m.config.controls_recording), None
+            )
+            owned = driver.signal_names() if driver is not None else []
+            default = next(
+                (n for n in owned if n.endswith("sample_temperature")),
+                owned[0] if owned else (names[0] if names else ""),
+            )
+            if default:
+                self._follow_signal.setCurrentText(default)
+        self._follow_signal.blockSignals(False)
+
     def _show_next_name(self) -> None:
         """Show the file that will actually be written, before it is."""
         stem = self._session_stem()
@@ -1426,6 +1516,7 @@ class MainWindow(QMainWindow):
         for form in self._device_forms:
             form.refresh_title()
         self._show_next_name()
+        self._refresh_follow_choices()
 
     def _update_controls(self) -> None:
         capturing = self._capturing
@@ -1507,6 +1598,17 @@ def _remember_theme(dark: bool) -> None:
     except OSError:
         # Losing a preference is not worth interrupting anyone over.
         pass
+
+
+_CARRY_TOOLTIP = (
+    "A signal that did not report on a row keeps the value it last reported,\n"
+    "so every row holds a complete picture.\n\n"
+    "The value is one the instrument actually sent - never averaged, never\n"
+    "interpolated - and it is only carried for a few of that signal's own\n"
+    "reporting intervals, so an instrument that stops goes blank rather than\n"
+    "appearing to still answer.\n\n"
+    "Turn this off to record only what was measured at each instant."
+)
 
 
 def _muted_style(dark: bool) -> str:
